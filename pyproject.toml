@@ -1,0 +1,45 @@
+[project]
+name = "stelarstrike"
+version = "0.1.0"
+description = "StelarStrike — modular, AI-assisted web vulnerability orchestration framework for authorized penetration testing."
+authors = [{ name = "Your Name", email = "you@example.com" }]
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["pentest", "security", "orchestrator", "sqli", "xss", "ssrf", "jwt", "idor"]
+
+dependencies = [
+    "httpx>=0.27.0",
+    "pydantic>=2.6.0",
+    "pyyaml>=6.0.1",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "python-dotenv>=1.0.1",
+    "jinja2>=3.1.3",
+    "tldextract>=5.1.1",
+    "beautifulsoup4>=4.12.3",
+    "PyJWT>=2.8.0",
+    "litellm>=1.35.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+    "mypy>=1.9.0",
+]
+
+[project.scripts]
+stelarstrike = "stelarstrike.cli:app"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["stelarstrike*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

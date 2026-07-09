@@ -1,0 +1,12 @@
+version: "3.9"
+
+services:
+  stelarstrike:
+    build: .
+    image: stelarstrike:local
+    env_file:
+      - .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./reports:/app/reports
+    command: ["scan", "https://target.example.com", "--config", "/app/config/config.yaml"]

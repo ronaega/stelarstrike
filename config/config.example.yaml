@@ -1,0 +1,82 @@
+# ==========================================================
+# StelarStrike main configuration
+# Copy to config/config.yaml and edit.
+# Values here can reference environment variables using ${VAR_NAME}.
+# Anything set in .env overrides the defaults below.
+# ==========================================================
+
+project:
+  name: "StelarStrike"
+  report_dir: "${STELAR_REPORT_DIR:-reports}"
+  log_level: "${STELAR_LOG_LEVEL:-INFO}"
+
+engagement:
+  # Freeform label shown in generated reports
+  name: "example-engagement"
+  # Only targets matching one of these patterns may be scanned.
+  # Required when STELAR_REQUIRE_SCOPE_FILE=true
+  scope:
+    - "https://target.example.com/*"
+    - "*.staging.example.com"
+  out_of_scope:
+    - "https://target.example.com/admin/*"
+  allow_active_payloads: "${STELAR_ALLOW_ACTIVE_PAYLOADS:-false}"
+
+http:
+  timeout_seconds: "${STELAR_TIMEOUT_SECONDS:-15}"
+  max_concurrency: "${STELAR_MAX_CONCURRENCY:-10}"
+  user_agent: "${STELAR_USER_AGENT}"
+  follow_redirects: true
+  verify_tls: true
+  extra_headers:
+    X-Scanned-By: "StelarStrike"
+
+# Toggle vulnerability plugins on/off and tune each one individually.
+# Plugin IDs must match the "id" attribute on each plugin class in
+# stelarstrike/plugins/.
+plugins:
+  sqli:
+    enabled: true
+    techniques: ["error-based", "boolean-blind", "time-blind"]
+    time_delay_seconds: 5
+  nosqli:
+    enabled: true
+    dbms_hints: ["mongodb"]
+  xss:
+    enabled: true
+    contexts: ["reflected", "stored", "dom"]
+  ssrf:
+    enabled: true
+    collaborator_url: ""   # optional out-of-band callback host (e.g. Interactsh)
+  csrf:
+    enabled: true
+    check_samesite: true
+  file_upload:
+    enabled: true
+    test_extensions: [".php", ".php5", ".phtml", ".svg", ".jsp", ".asp"]
+  idor:
+    enabled: true
+    id_param_hints: ["id", "user_id", "uid", "account", "order_id"]
+  jwt:
+    enabled: true
+    checks: ["alg-none", "weak-secret", "kid-injection", "expired-token-reuse"]
+
+ai:
+  enabled: "${STELAR_AI_ENABLED:-true}"
+  provider: "${STELAR_AI_PROVIDER:-anthropic/claude-sonnet-4-6}"
+  max_tokens: "${STELAR_AI_MAX_TOKENS:-2000}"
+  temperature: "${STELAR_AI_TEMPERATURE:-0.2}"
+  roles:
+    triage: true          # AI ranks/deduplicates raw findings by exploitability
+    report_writer: true   # AI drafts human-readable narrative + remediation text
+    payload_advisor: false # AI suggests payload variants (off by default, active-testing only)
+
+reporting:
+  formats: ["markdown", "json"]
+  include_raw_evidence: true
+  redact_secrets: true
+
+notifications:
+  slack_webhook_url: "${STELAR_SLACK_WEBHOOK_URL:-}"
+  discord_webhook_url: "${STELAR_DISCORD_WEBHOOK_URL:-}"
+  notify_on: ["scan_complete", "critical_finding"]

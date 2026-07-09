@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Env & secrets
+.env
+*.local.yaml
+
+# Config with real scope/targets (keep the .example, not the real one)
+config/config.yaml
+
+# Reports (may contain sensitive findings — don't commit real engagement data)
+reports/*
+!reports/.gitkeep
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Test / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
