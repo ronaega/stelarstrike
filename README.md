@@ -1,4 +1,17 @@
-# ⭐ StelarStrike
+# StelarStrike
+
+<p align="center">
+  <img src="./logo.png" alt="StelarStrike logo" width="180" />
+</p>
+
+<p align="center">
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" /></a>
+  <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker" /></a>
+  <a href="https://github.com/features/actions"><img src="https://img.shields.io/badge/GitHub%20Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white" alt="GitHub Actions" /></a>
+  <a href="https://openai.com/"><img src="https://img.shields.io/badge/OpenAI-412991?style=for-the-badge&logo=openai&logoColor=white" alt="OpenAI" /></a>
+  <a href="https://github.com/BerriAI/litellm"><img src="https://img.shields.io/badge/LiteLLM-000000?style=for-the-badge&logo=ollama&logoColor=white" alt="LiteLLM" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="MIT License" /></a>
+</p>
 
 **StelarStrike** is a modular, AI-assisted web vulnerability orchestration framework for **authorized** penetration testing and security research. It coordinates a set of plugin-based vulnerability checks against a target, optionally uses an LLM to triage findings and draft a report narrative, and outputs a clean Markdown/JSON report.
 
