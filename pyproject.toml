@@ -2,7 +2,7 @@
 name = "stelarstrike"
 version = "0.1.0"
 description = "StelarStrike — modular, AI-assisted web vulnerability orchestration framework for authorized penetration testing."
-authors = [{ name = "Your Name", email = "you@example.com" }]
+authors = [{ name = "Rona", email = "you@example.com" }]
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
