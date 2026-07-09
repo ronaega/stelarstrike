@@ -1,0 +1,109 @@
+"""
+Orchestrator: the core loop that ties everything together.
+
+Responsibilities:
+  1. Validate the target against engagement scope (fail closed).
+  2. Instantiate every enabled plugin.
+  3. Run plugins concurrently (bounded by http.max_concurrency).
+  4. Collect Findings into a ReportBuilder.
+  5. Optionally hand findings to the AI layer for triage + narrative.
+  6. Write markdown/json reports to disk.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import httpx
+
+from stelarstrike.core.ai_client import AIClient
+from stelarstrike.core.config import Settings
+from stelarstrike.core.report import Finding, ReportBuilder
+from stelarstrike.core.target import Target, enforce_scope
+from stelarstrike.plugins import PLUGIN_REGISTRY
+from stelarstrike.plugins.base import PluginContext
+from stelarstrike.utils.logger import get_logger
+
+log = get_logger(__name__)
+
+
+class Orchestrator:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.ai_client = AIClient(settings.ai)
+
+    async def run(self, target_url: str) -> ReportBuilder:
+        target = Target(url=target_url)
+        enforce_scope(
+            target,
+            scope=self.settings.engagement.scope,
+            out_of_scope=self.settings.engagement.out_of_scope,
+        )
+
+        report = ReportBuilder(
+            engagement_name=self.settings.engagement.name,
+            report_dir=self.settings.report_dir,
+        )
+
+        limits = httpx.Limits(max_connections=self.settings.http.max_concurrency)
+        headers = {"User-Agent": self.settings.http.user_agent, **self.settings.http.extra_headers}
+
+        async with httpx.AsyncClient(
+            timeout=self.settings.http.timeout_seconds,
+            follow_redirects=self.settings.http.follow_redirects,
+            verify=self.settings.http.verify_tls,
+            limits=limits,
+            headers=headers,
+        ) as http_client:
+            semaphore = asyncio.Semaphore(self.settings.http.max_concurrency)
+            tasks = []
+
+            for plugin_id, plugin_cls in PLUGIN_REGISTRY.items():
+                plugin_cfg = self.settings.plugins.get(plugin_id)
+                if plugin_cfg is None or not plugin_cfg.enabled:
+                    log.info(f"[skip] plugin '{plugin_id}' disabled in config")
+                    continue
+
+                ctx = PluginContext(
+                    target=target,
+                    http_client=http_client,
+                    options=plugin_cfg.options,
+                    allow_active_payloads=self.settings.engagement.allow_active_payloads,
+                    semaphore=semaphore,
+                )
+                tasks.append(self._run_plugin(plugin_id, plugin_cls, ctx, report))
+
+            if tasks:
+                await asyncio.gather(*tasks)
+
+        if self.ai_client.config.enabled:
+            findings_dicts = report.as_dicts()
+            triaged = self.ai_client.triage_findings(findings_dicts)
+            self._apply_triage(report, triaged)
+            report.narrative = self.ai_client.draft_report_narrative(
+                self.settings.engagement.name, report.as_dicts()
+            )
+
+        return report
+
+    @staticmethod
+    async def _run_plugin(plugin_id: str, plugin_cls: Any, ctx: PluginContext, report: ReportBuilder) -> None:
+        log.info(f"[run]  plugin '{plugin_id}' -> {ctx.target.url}")
+        try:
+            plugin = plugin_cls(ctx)
+            findings: list[Finding] = await plugin.run()
+            for f in findings:
+                report.add(f)
+            log.info(f"[done] plugin '{plugin_id}': {len(findings)} finding(s)")
+        except Exception as exc:  # noqa: BLE001 — one plugin failing must not kill the scan
+            log.error(f"[fail] plugin '{plugin_id}' raised: {exc}")
+
+    @staticmethod
+    def _apply_triage(report: ReportBuilder, triaged: list[dict[str, Any]]) -> None:
+        """Merge AI-added priority/exploitability_note fields back onto Findings."""
+        if len(triaged) != len(report.findings):
+            return
+        for finding, triaged_item in zip(report.findings, triaged):
+            finding.extra["priority"] = triaged_item.get("priority")
+            finding.extra["exploitability_note"] = triaged_item.get("exploitability_note")
