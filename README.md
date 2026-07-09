@@ -99,7 +99,7 @@ stelarstrike/
 Requires Python **3.10+**.
 
 ```bash
-git clone https://github.com/<your-username>/stelarstrike.git
+git clone https://github.com/ronaega/stelarstrike.git
 cd stelarstrike
 
 python -m venv .venv
