@@ -19,6 +19,7 @@ import httpx
 
 from stelarstrike.core.ai_client import AIClient
 from stelarstrike.core.config import Settings
+from stelarstrike.core.discovery import discover_targets
 from stelarstrike.core.report import Finding, ReportBuilder
 from stelarstrike.core.target import Target, enforce_scope
 from stelarstrike.plugins import PLUGIN_REGISTRY
@@ -57,22 +58,39 @@ class Orchestrator:
             headers=headers,
         ) as http_client:
             semaphore = asyncio.Semaphore(self.settings.http.max_concurrency)
-            tasks = []
 
-            for plugin_id, plugin_cls in PLUGIN_REGISTRY.items():
-                plugin_cfg = self.settings.plugins.get(plugin_id)
-                if plugin_cfg is None or not plugin_cfg.enabled:
-                    log.info(f"[skip] plugin '{plugin_id}' disabled in config")
-                    continue
-
-                ctx = PluginContext(
-                    target=target,
+            target_urls = [target_url]
+            if self.settings.discovery.enabled:
+                target_urls = await discover_targets(
+                    base_url=target_url,
                     http_client=http_client,
-                    options=plugin_cfg.options,
-                    allow_active_payloads=self.settings.engagement.allow_active_payloads,
-                    semaphore=semaphore,
+                    scope=self.settings.engagement.scope,
+                    out_of_scope=self.settings.engagement.out_of_scope,
+                    max_urls=self.settings.discovery.max_urls,
+                    max_depth=self.settings.discovery.max_depth,
+                    synthetic_params=self.settings.discovery.synthetic_params,
                 )
-                tasks.append(self._run_plugin(plugin_id, plugin_cls, ctx, report))
+                log.info(f"Discovery: scanning {len(target_urls)} URL(s): {target_urls}")
+
+            tasks = []
+            for url in target_urls:
+                url_target = Target(url=url)
+                for plugin_id, plugin_cls in PLUGIN_REGISTRY.items():
+                    plugin_cfg = self.settings.plugins.get(plugin_id)
+                    if plugin_cfg is None or not plugin_cfg.enabled:
+                        continue
+
+                    ctx = PluginContext(
+                        target=url_target,
+                        http_client=http_client,
+                        options=plugin_cfg.options,
+                        allow_active_payloads=self.settings.engagement.allow_active_payloads,
+                        semaphore=semaphore,
+                    )
+                    tasks.append(self._run_plugin(plugin_id, plugin_cls, ctx, report))
+
+            if not tasks:
+                log.info("No enabled plugins to run — check `plugins:` in config.yaml")
 
             if tasks:
                 await asyncio.gather(*tasks)

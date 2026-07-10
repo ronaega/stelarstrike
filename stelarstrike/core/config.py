@@ -65,11 +65,21 @@ class EngagementConfig(BaseModel):
     allow_active_payloads: bool = False
 
 
+class DiscoveryConfig(BaseModel):
+    enabled: bool = True
+    max_urls: int = 10
+    max_depth: int = 1
+    synthetic_params: list[str] = Field(
+        default_factory=lambda: ["id", "page", "category", "search", "q", "user_id"]
+    )
+
+
 class Settings(BaseModel):
     project_name: str = "StelarStrike"
     report_dir: str = "reports"
     log_level: str = "INFO"
     engagement: EngagementConfig = Field(default_factory=EngagementConfig)
+    discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
     plugins: dict[str, PluginConfig] = Field(default_factory=dict)
     ai: AIConfig = Field(default_factory=AIConfig)
@@ -107,6 +117,7 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         report_dir=raw.get("project", {}).get("report_dir", "reports"),
         log_level=raw.get("project", {}).get("log_level", "INFO"),
         engagement=EngagementConfig(**raw.get("engagement", {})),
+        discovery=DiscoveryConfig(**raw.get("discovery", {})),
         http=HttpConfig(**raw.get("http", {})),
         plugins=plugins,
         ai=AIConfig(**raw.get("ai", {})),

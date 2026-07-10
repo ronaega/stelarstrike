@@ -27,7 +27,7 @@ Penetration testers and security researchers routinely re-run the same handful o
 
 - NG1 — Not a network/infra scanner (no port scanning, no OS-level checks).
 - NG2 — Not an authenticated-session manager — v1.0 assumes the target URL/cookies/headers you pass in are already sufficient (no login-flow automation yet).
-- NG3 — Not a fuzzer/brute-forcer — no wordlist-based directory or parameter discovery in v1.0 (candidate for v1.x, see §8).
+- NG3 — Not a full spider/fuzzer — discovery (§5.5) is a lightweight, one-level-deep same-origin crawl to find parametrized URLs, not exhaustive wordlist-based directory/parameter brute-forcing (candidate for a future deeper-crawl mode).
 - NG4 — No built-in OOB collaborator server — SSRF OOB checks rely on a user-supplied collaborator URL.
 - NG5 — No GUI/dashboard — CLI + Markdown/JSON reports only.
 
@@ -92,9 +92,20 @@ Each plugin below lists: detection strategy, passive vs. active split, config ke
 ### 5.1 Orchestration requirements
 
 - OR1 — Plugins run concurrently via `asyncio.gather`, bounded by `http.max_concurrency` (shared `asyncio.Semaphore`).
-- OR2 — Scope is enforced once, before any plugin instantiates (`core/target.py::enforce_scope`), and raises `ScopeError` which the CLI surfaces as a clean error + exit code 1 (never a stack trace).
+- OR2 — Scope is enforced once on the user-supplied target, before any plugin or discovery crawl runs (`core/target.py::enforce_scope`), and raises `ScopeError` which the CLI surfaces as a clean error + exit code 1 (never a stack trace).
 - OR3 — A plugin raising an unhandled exception is caught at the orchestrator level, logged, and excluded from the report — it must not abort other plugins.
 - OR4 — All plugins share one `httpx.AsyncClient` instance per scan (connection pooling, consistent headers/cookies/timeout).
+- OR5 — When discovery is enabled, every enabled plugin runs once per discovered URL (not just the user-supplied one); findings from all URLs are aggregated into a single report.
+
+### 5.5 Auto-discovery requirements
+
+- DI1 — If `discovery.enabled` is true (default), `core/discovery.py::discover_targets` runs once per scan, before plugins, against the user-supplied target.
+- DI2 — Discovery fetches the base URL, extracts same-origin `<a href>` links and `<form>` elements. Links carrying a query string are kept directly as candidates; GET forms are converted into a candidate URL using their input names (dummy value `"1"` unless the form specifies a default).
+- DI3 — Discovery follows same-origin links one level deep (bounded by `discovery.max_depth` and `discovery.max_urls`) to find forms on pages like `/search` or `/login` that aren't linked with a query string themselves.
+- DI4 — If, after crawling, zero parametrized URLs are found anywhere (including the original target), discovery falls back to appending each name in `discovery.synthetic_params` to the original URL as a guessed candidate — this keeps injection-style plugins (`sqli`, `nosqli`, `idor`) from being completely blind on a single-page target, at the cost of some guaranteed-empty synthetic checks.
+- DI5 — **Every** candidate URL (crawled or synthetic) is re-validated against `engagement.scope` / `engagement.out_of_scope` before being returned. Discovery must never cause a scan to touch a URL that wouldn't have passed scope enforcement if the user had typed it manually. Cross-origin links are dropped before the scope check even runs (discovery never leaves the target's origin).
+- DI6 — The original user-supplied URL is always included in the final candidate list, even if it isn't independently "discoverable" (e.g. it's always in the returned list at position 0 barring a scope conflict).
+- DI7 — Discovery failures (target unreachable, parse errors) degrade gracefully to `[base_url]` — a broken crawl must never abort the scan.
 
 ### 5.2 AI layer requirements
 
@@ -130,6 +141,12 @@ engagement:
   scope: [glob pattern, ...]           # required for any scan to run (unless empty = allow-all, discouraged)
   out_of_scope: [glob pattern, ...]
   allow_active_payloads: bool          # global gate for exploit-confirming payloads across ALL plugins
+
+discovery:
+  enabled: bool                        # crawl for parametrized URLs when the target has none
+  max_urls: int
+  max_depth: int
+  synthetic_params: [string, ...]      # fallback param names guessed when nothing is discoverable
 
 http:
   timeout_seconds: float
@@ -189,9 +206,8 @@ Ordered roughly by expected value; not a committed timeline.
 ### v1.2 — Engagement modes
 - Introduce named modes (`bug-bounty`, `ctf`, `internal-audit`) that set sensible defaults for `allow_active_payloads`, plugin subsets, and report format — analogous to presets, not auto-detection magic.
 
-### v1.3 — Discovery layer
-- Optional lightweight crawler to enumerate URLs/forms/params from a starting point, feeding the plugin layer instead of requiring the user to enumerate every endpoint URL manually.
-- Optional wordlist-based parameter/endpoint discovery (opt-in, since this is inherently noisier/louder).
+### v1.3 — Deeper discovery
+- v1.0 ships a lightweight, one-level-deep same-origin crawler (see §5.5). A future version could go deeper (configurable crawl depth beyond 1), add wordlist-based directory/parameter brute-forcing as an opt-in "loud" mode, and respect `robots.txt`/rate limits more explicitly for larger targets.
 
 ### v1.4 — Session/auth handling
 - Config-driven login flow (fill a login form once, reuse the resulting session/cookies/bearer token across all plugins) so IDOR/CSRF/etc. can test authenticated endpoints properly.
@@ -210,4 +226,5 @@ Ordered roughly by expected value; not a committed timeline.
 
 ## 10. Change Log
 
+- **2026-07-10** — Auto-discovery pulled forward from the v1.3 roadmap into v1.0: `core/discovery.py` crawls same-origin links/forms one level deep and falls back to synthetic common parameter names, so `scan` no longer requires the user to manually supply a query parameter. Orchestrator now fans plugins out across every discovered (in-scope) URL. Added the CLI startup banner.
 - **2026-07-09** — v1.0 initial PRD + implementation: 8 plugins (sqli, nosqli, xss, ssrf, csrf, file_upload, idor, jwt), config system, AI layer via LiteLLM, Markdown/JSON reporting, Docker + GitHub Actions CI.

@@ -22,6 +22,18 @@ engagement:
     - "https://target.example.com/admin/*"
   allow_active_payloads: "${STELAR_ALLOW_ACTIVE_PAYLOADS:-false}"
 
+# Auto-discovery: when the target URL you pass to `scan` has no query
+# string, StelarStrike crawls same-origin links/forms one level deep to
+# find parametrized URLs for plugins like sqli/nosqli/idor/ssrf to test.
+# If nothing parametrized is found, it falls back to guessing a small
+# set of common parameter names against the original URL.
+# Disable this if you want to scan EXACTLY the URL you passed, nothing else.
+discovery:
+  enabled: true
+  max_urls: 10
+  max_depth: 1
+  synthetic_params: ["id", "page", "category", "search", "q", "user_id"]
+
 http:
   timeout_seconds: "${STELAR_TIMEOUT_SECONDS:-15}"
   max_concurrency: "${STELAR_MAX_CONCURRENCY:-10}"

@@ -30,6 +30,7 @@
   - [2. Main config (`config/config.yaml`)](#2-main-config-configconfigyaml)
   - [3. Configuring the AI model](#3-configuring-the-ai-model)
   - [4. Configuring individual plugins](#4-configuring-individual-plugins)
+  - [5. Auto-discovery](#5-auto-discovery-scanning-without-manually-specifying-parameters)
 - [Scope Enforcement](#scope-enforcement)
 - [Usage](#usage)
 - [Running with Docker](#running-with-docker)
@@ -238,6 +239,22 @@ engagement:
   allow_active_payloads: false   # set true only once you've confirmed you're authorized for active testing
 ```
 
+### 5. Auto-discovery (scanning without manually specifying parameters)
+
+Plugins like `sqli`, `nosqli`, `idor`, and `ssrf` need a query parameter to test. If you pass `scan` a bare URL with no query string, StelarStrike doesn't just give up — it crawls the page for same-origin links and forms one level deep, converts any GET forms it finds into parametrized URLs, and scans all of them. If nothing parametrized turns up anywhere, it falls back to guessing a small set of common parameter names (`id`, `page`, `search`, `q`, ...) against your original URL so injection-style plugins still have something to probe.
+
+Every discovered URL is re-checked against `engagement.scope` before it's touched — discovery can only narrow within scope you already approved, never widen it, and it never follows links to a different origin.
+
+```yaml
+discovery:
+  enabled: true
+  max_urls: 10
+  max_depth: 1
+  synthetic_params: ["id", "page", "category", "search", "q", "user_id"]
+```
+
+Set `discovery.enabled: false` if you want StelarStrike to scan *exactly* the URL you passed and nothing else.
+
 ## Scope Enforcement
 
 Before any plugin runs, `stelarstrike/core/target.py` checks the target URL/host against `engagement.scope` and `engagement.out_of_scope` (glob patterns). If the target doesn't match an entry in `scope`, or matches an entry in `out_of_scope`, the scan is refused with a `ScopeError` before a single request is sent.
@@ -269,8 +286,33 @@ stelarstrike scan "https://target.example.com/page?id=1" \
 Sample output:
 
 ```
-StelarStrike v0.1.0 — scanning https://target.example.com/page?id=1
-Engagement: my-first-engagement | AI: on (anthropic/claude-sonnet-4-6)
+                 ▒---------------------------
+                   ░----- LET'S STRIKE ------
+                    ▒---------- BABY ! ! ! --
+       ░░            ░-----------------------
+   ░░░▒░░░▒▒▓▓▒░     ░▒-----------██▓▒▓███---
+ ░▒▓▓▓▓▓▓▓▓▓▓▓▒▓▒░     ▒------███▓▒░░▒▒▒▒▓██-
+▒▓▓▓▓▒░░░░▒▓████▓▒░    ░----█▓▓▓▒░░░▒▒▒▒▒▒▒▒▓
+▓▓▓▓▒░░░▒░ ░▒▓███▓░   ░----█▒▒▓▒░░▒▒▒▒▒▒▒▒▒▒▒
+▓▓███▒░   ░░▒▓▓▒▒▓▒  ▒-----▓▒▒░░░▒▒▒▒▒▒▒▒░░░░
+▓▓████▒░░▒▒▓█▓░░ ░░░-------▒▒░░░░░░░▒▒▒▒░░░░░
+▓▓▓██████████▓  ░░▒--------░▒▒░░   ░░▒▒░░   ░
+▒▒▒▒▒▒▓▓█████▓░░░---------▓░░░░░░░░░░▓█▓▒░░▒▓
+░▒░░▓▓▓░░▒▓▓█▓▓-----------▓▒▒▒▒▒▒▒▒▒▒████████
+░▒░ ░░▒░░░░░░▓▓------------▒▒▒▒▓▓▓▒▒▒▒▓▓▓▒▒▓█
+░░▒▒▒▒▒░░░░░░▒▒------------▓░▒▓▓▓▒▒▒▒░░▓██▒▒▒
+░░▒▒▒░░▒░░ ░░▒▓-------------▒▒▒▓▒▒░░░▒▒▒▒░░░▒
+░░░▒▒▒░░░░░░  ▒-------------▒▒▒▓▒▒▒▒▒░░▒▓██▒▒
+░░░░░░░░░      ░▒-----------░░░▒▒▒▒▒▒▒▒▒▒▓▓▒▒
+░░░░             ░▓--------░░░░░░░▒▒▒▒▒▓▓▓▒▒▒
+         S T E L A R S T R I K E
+               by Stelariux
+                v0.1.0-dev
+─────────────────────────────────────────────
+
+Scanning: https://target.example.com/
+Engagement: my-first-engagement | AI: on (anthropic/claude-sonnet-4-6) | Discovery: on
+[INFO] Discovery: scanning 4 URL(s): ['https://target.example.com/', 'https://target.example.com/product?id=1', 'https://target.example.com/search?q=1', ...]
 
                      Findings — my-first-engagement
 ┏━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┓
@@ -283,6 +325,8 @@ Engagement: my-first-engagement | AI: on (anthropic/claude-sonnet-4-6)
 Report written: reports/my-first-engagement-20260709-142200.md
 Report written: reports/my-first-engagement-20260709-142200.json
 ```
+
+Note: if you pass a URL that already has a query string (e.g. `?id=1`), StelarStrike scans that exact URL plus anything else it discovers — it never skips the URL you explicitly gave it.
 
 ## Running with Docker
 

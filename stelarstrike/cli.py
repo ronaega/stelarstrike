@@ -20,6 +20,32 @@ app = typer.Typer(
 )
 console = Console()
 
+BANNER = r"""
+                 ▒---------------------------
+                   ░----- LET'S STRIKE ------
+                    ▒---------- BABY ! ! ! --
+       ░░            ░-----------------------
+   ░░░▒░░░▒▒▓▓▒░     ░▒-----------██▓▒▓███---
+ ░▒▓▓▓▓▓▓▓▓▓▓▓▒▓▒░     ▒------███▓▒░░▒▒▒▒▓██-
+▒▓▓▓▓▒░░░░▒▓████▓▒░    ░----█▓▓▓▒░░░▒▒▒▒▒▒▒▒▓
+▓▓▓▓▒░░░▒░ ░▒▓███▓░   ░----█▒▒▓▒░░▒▒▒▒▒▒▒▒▒▒▒
+▓▓███▒░   ░░▒▓▓▒▒▓▒  ▒-----▓▒▒░░░▒▒▒▒▒▒▒▒░░░░
+▓▓████▒░░▒▒▓█▓░░ ░░░-------▒▒░░░░░░░▒▒▒▒░░░░░
+▓▓▓██████████▓  ░░▒--------░▒▒░░   ░░▒▒░░   ░
+▒▒▒▒▒▒▓▓█████▓░░░---------▓░░░░░░░░░░▓█▓▒░░▒▓
+░▒░░▓▓▓░░▒▓▓█▓▓-----------▓▒▒▒▒▒▒▒▒▒▒████████
+░▒░ ░░▒░░░░░░▓▓------------▒▒▒▒▓▓▓▒▒▒▒▓▓▓▒▒▓█
+░░▒▒▒▒▒░░░░░░▒▒------------▓░▒▓▓▓▒▒▒▒░░▓██▒▒▒
+░░▒▒▒░░▒░░ ░░▒▓-------------▒▒▒▓▒▒░░░▒▒▒▒░░░▒
+░░░▒▒▒░░░░░░  ▒-------------▒▒▒▓▒▒▒▒▒░░▒▓██▒▒
+░░░░░░░░░      ░▒-----------░░░▒▒▒▒▒▒▒▒▒▒▓▓▒▒
+░░░░             ░▓--------░░░░░░░▒▒▒▒▒▓▓▓▒▒▒
+         S T E L A R S T R I K E
+               by Stelariux
+                v0.1.0-dev
+─────────────────────────────────────────────
+"""
+
 
 @app.command()
 def scan(
@@ -28,10 +54,12 @@ def scan(
     formats: str = typer.Option("markdown,json", "--formats", help="Comma-separated report formats to write"),
 ):
     """Run a full scan (all enabled plugins) against TARGET."""
+    console.print(BANNER, style="bold cyan", markup=False, highlight=False)
+
     settings = load_settings(config)
 
-    console.print(f"[bold cyan]StelarStrike[/] v0.1.0 — scanning [bold]{target}[/]")
-    console.print(f"Engagement: [bold]{settings.engagement.name}[/] | AI: {'on' if settings.ai.enabled else 'off'} ({settings.ai.provider if settings.ai.enabled else 'n/a'})")
+    console.print(f"Scanning: [bold]{target}[/]")
+    console.print(f"Engagement: [bold]{settings.engagement.name}[/] | AI: {'on' if settings.ai.enabled else 'off'} ({settings.ai.provider if settings.ai.enabled else 'n/a'}) | Discovery: {'on' if settings.discovery.enabled else 'off'}")
 
     orchestrator = Orchestrator(settings)
     try:
