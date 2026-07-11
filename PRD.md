@@ -30,6 +30,7 @@ Penetration testers and security researchers routinely re-run the same handful o
 - NG3 — Not a full spider/fuzzer — discovery (§5.5) is a lightweight, one-level-deep same-origin crawl to find parametrized URLs, not exhaustive wordlist-based directory/parameter brute-forcing (candidate for a future deeper-crawl mode).
 - NG4 — No built-in OOB collaborator server — SSRF OOB checks rely on a user-supplied collaborator URL.
 - NG5 — No GUI/dashboard — CLI + Markdown/JSON reports only.
+- NG6 — No automated data extraction, even where a vulnerability is confirmed exploitable (e.g. `sqli`'s UNION-confirm stops at column count; it never runs `version()`/`information_schema` queries or dumps rows) and no automated second-order SQLi (register-then-trigger chains). Both are legitimate follow-up techniques but are meaningfully more invasive/stateful than every other check in this tool and are left to manual, human-supervised follow-up.
 
 ## 3. Target Users
 
@@ -80,7 +81,7 @@ Each plugin below lists: detection strategy, passive vs. active split, config ke
 
 | # | Plugin ID | Detection strategy (passive) | Detection strategy (active, `allow_active_payloads: true`) | Severity | CWE |
 |---|---|---|---|---|---|
-| 1 | `sqli` | Error-based: inject `'`, match DB error signatures. Boolean-blind: compare response length between TRUE/FALSE injected conditions. | Time-blind: `SLEEP()`-style payload, compare latency vs. baseline. | high | CWE-89 |
+| 1 | `sqli` | Error-based (multi-DBMS signatures: MySQL/PostgreSQL/MSSQL/SQLite/Oracle + framework debug-page leaks), baseline-checked to filter false positives. Boolean-blind: dual-TRUE-payload verified, dynamic-content-stripped comparison. Tests query params AND every form field, POST as both form-encoded and JSON body. Login-form auth-bypass detection (password-field heuristic). | Time-blind: MySQL/PostgreSQL/MSSQL delay payloads. UNION column-count confirmation (stops at confirmation, never extracts data) after error-based confirms injectability. | high (critical for confirmed auth-bypass or UNION-exploitable) | CWE-89 |
 | 2 | `nosqli` | Send `$ne`/operator payload as JSON body value, compare status/length against baseline; match Mongo/BSON error signatures. | (same checks; no separate active-only path in v1.0) | high | CWE-943 |
 | 3 | `xss` | Inject a unique marker with HTML metacharacters into query params and form fields, check for unescaped reflection. | Full `<script>` payload round-trip confirmation. | medium (high if confirmed) | CWE-79 |
 | 4 | `ssrf` | Flag parameters by name/value heuristics (url, redirect, webhook, already-a-URL, ...). | Send out-of-band probe to a user-configured collaborator URL. | high (low/informational for heuristic-only) | CWE-918 |
@@ -122,9 +123,10 @@ Each plugin below lists: detection strategy, passive vs. active split, config ke
 
 ### 5.4 CLI requirements
 
-- CLI1 — `stelarstrike scan <target> [--config PATH] [--formats markdown,json]` — run a scan.
+- CLI1 — `stelarstrike scan <target> [--config PATH] [--formats markdown,json] [--plugins id1,id2] [--verbose]` — run a scan. `--plugins` overrides config.yaml's per-plugin `enabled` flags for that single run (does not persist/write back to config); omitted means "whatever config.yaml has enabled." `--verbose` forces DEBUG-level logging so every payload/response a plugin tries is visible — the primary tool for diagnosing an empty-findings scan.
 - CLI2 — `stelarstrike plugins` — list all registered plugins (id, name, default severity) — must reflect `PLUGIN_REGISTRY` live, no hardcoded list.
 - CLI3 — `stelarstrike doctor [--config PATH]` — validate config loads, list enabled plugins, warn if scope is empty, check `litellm` is installed when AI is enabled.
+- CLI4 — Every `scan` invocation prints the ASCII banner (branding/identity) before any config loading or network activity begins.
 
 ## 6. Configuration Contract
 
@@ -226,5 +228,6 @@ Ordered roughly by expected value; not a committed timeline.
 
 ## 10. Change Log
 
+- **2026-07-10 (2)** — `sqli` rewritten (v3): tests query params and every form field, POST as both form-encoded and JSON body; multi-DBMS error signatures + framework debug-page leaks; baseline false-positive filtering; dual-payload-verified boolean-blind with dynamic-content stripping; login-form auth-bypass detection; bounded UNION column-count confirmation (detection only, no data extraction). Added `stelarstrike scan --plugins id1,id2` (one-off plugin selection override) and `--verbose` (full request/payload debug logging) CLI flags.
 - **2026-07-10** — Auto-discovery pulled forward from the v1.3 roadmap into v1.0: `core/discovery.py` crawls same-origin links/forms one level deep and falls back to synthetic common parameter names, so `scan` no longer requires the user to manually supply a query parameter. Orchestrator now fans plugins out across every discovered (in-scope) URL. Added the CLI startup banner.
 - **2026-07-09** — v1.0 initial PRD + implementation: 8 plugins (sqli, nosqli, xss, ssrf, csrf, file_upload, idor, jwt), config system, AI layer via LiteLLM, Markdown/JSON reporting, Docker + GitHub Actions CI.

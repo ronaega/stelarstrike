@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 
 from stelarstrike.core.ai_client import AIClient
-from stelarstrike.core.config import Settings
+from stelarstrike.core.config import PluginConfig, Settings
 from stelarstrike.core.discovery import discover_targets
 from stelarstrike.core.report import Finding, ReportBuilder
 from stelarstrike.core.target import Target, enforce_scope
@@ -34,7 +34,7 @@ class Orchestrator:
         self.settings = settings
         self.ai_client = AIClient(settings.ai)
 
-    async def run(self, target_url: str) -> ReportBuilder:
+    async def run(self, target_url: str, plugin_filter: set[str] | None = None) -> ReportBuilder:
         target = Target(url=target_url)
         enforce_scope(
             target,
@@ -76,9 +76,16 @@ class Orchestrator:
             for url in target_urls:
                 url_target = Target(url=url)
                 for plugin_id, plugin_cls in PLUGIN_REGISTRY.items():
-                    plugin_cfg = self.settings.plugins.get(plugin_id)
-                    if plugin_cfg is None or not plugin_cfg.enabled:
-                        continue
+                    if plugin_filter is not None:
+                        # CLI --plugins was given: it's the sole selector for this run,
+                        # regardless of each plugin's `enabled` flag in config.yaml.
+                        if plugin_id not in plugin_filter:
+                            continue
+                        plugin_cfg = self.settings.plugins.get(plugin_id) or PluginConfig()
+                    else:
+                        plugin_cfg = self.settings.plugins.get(plugin_id)
+                        if plugin_cfg is None or not plugin_cfg.enabled:
+                            continue
 
                     ctx = PluginContext(
                         target=url_target,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import typer
 from rich.console import Console
@@ -52,18 +53,43 @@ def scan(
     target: str = typer.Argument(..., help="Target URL to scan, e.g. https://target.example.com/page?id=1"),
     config: str = typer.Option("config/config.yaml", "--config", "-c", help="Path to config.yaml"),
     formats: str = typer.Option("markdown,json", "--formats", help="Comma-separated report formats to write"),
+    plugins_opt: str = typer.Option(
+        None,
+        "--plugins",
+        "-p",
+        help=(
+            "Comma-separated plugin IDs to run for THIS scan only, e.g. --plugins sqli,xss. "
+            "Overrides config.yaml's enabled/disabled flags for this run. "
+            "Omit to scan with whatever config.yaml has enabled (all 8 plugins, by default)."
+        ),
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show every request/payload each plugin tries — use this when a scan finds nothing and you need to see why."),
 ):
-    """Run a full scan (all enabled plugins) against TARGET."""
+    """Run a scan against TARGET. Runs all config-enabled plugins by default; use --plugins to run only specific ones."""
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
     console.print(BANNER, style="bold cyan", markup=False, highlight=False)
 
     settings = load_settings(config)
 
+    plugin_filter: set[str] | None = None
+    if plugins_opt:
+        requested = {p.strip() for p in plugins_opt.split(",") if p.strip()}
+        unknown = requested - set(PLUGIN_REGISTRY)
+        if unknown:
+            console.print(f"[bold red]Unknown plugin id(s):[/] {', '.join(sorted(unknown))}")
+            console.print(f"Available: {', '.join(PLUGIN_REGISTRY)}")
+            raise typer.Exit(code=1)
+        plugin_filter = requested
+
     console.print(f"Scanning: [bold]{target}[/]")
-    console.print(f"Engagement: [bold]{settings.engagement.name}[/] | AI: {'on' if settings.ai.enabled else 'off'} ({settings.ai.provider if settings.ai.enabled else 'n/a'}) | Discovery: {'on' if settings.discovery.enabled else 'off'}")
+    running = ", ".join(sorted(plugin_filter)) if plugin_filter else "all enabled in config.yaml"
+    console.print(f"Engagement: [bold]{settings.engagement.name}[/] | AI: {'on' if settings.ai.enabled else 'off'} ({settings.ai.provider if settings.ai.enabled else 'n/a'}) | Discovery: {'on' if settings.discovery.enabled else 'off'} | Plugins: {running}")
 
     orchestrator = Orchestrator(settings)
     try:
-        report = asyncio.run(orchestrator.run(target))
+        report = asyncio.run(orchestrator.run(target, plugin_filter=plugin_filter))
     except ScopeError as exc:
         console.print(f"[bold red]Scope error:[/] {exc}")
         raise typer.Exit(code=1)

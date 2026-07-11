@@ -36,6 +36,7 @@
 - [Running with Docker](#running-with-docker)
 - [Reports](#reports)
 - [Extending StelarStrike (adding a new vulnerability class)](#extending-stelarstrike-adding-a-new-vulnerability-class)
+- [Debugging a scan that finds nothing](#debugging-a-scan-that-finds-nothing)
 - [Testing](#testing)
 - [CI/CD](#cicd)
 - [Roadmap](#roadmap)
@@ -71,6 +72,8 @@ Version 1.0 ships with **8 vulnerability class plugins**:
 | `jwt`         | JSON Web Token vulnerabilities    | CWE-347 / CWE-798 / CWE-613 |
 
 Everything else — engagement modes, additional vuln classes, CI/CD scanning integration, distributed scanning — is intentionally deferred. See [`PRD.md`](./PRD.md) for the full roadmap and design rationale, and [Roadmap](#roadmap) below for a summary.
+
+`sqli` is the most developed plugin — it tests query params AND every form on the page (GET, plus POST as both form-encoded and JSON body), covers MySQL/PostgreSQL/MSSQL/SQLite/Oracle error signatures, filters false positives against a baseline request, detects login-form authentication bypass, and (with `allow_active_payloads: true`) confirms UNION-based data-extraction exploitability by column count — without ever actually extracting table data itself. See [Debugging a scan that finds nothing](#debugging-a-scan-that-finds-nothing) if you expect findings and aren't getting any.
 
 ## Architecture
 
@@ -277,11 +280,20 @@ stelarstrike plugins
 # Sanity-check your configuration + AI connectivity
 stelarstrike doctor
 
-# Run a full scan
+# Run a full scan (all plugins enabled in config.yaml)
 stelarstrike scan "https://target.example.com/page?id=1" \
   --config config/config.yaml \
   --formats markdown,json
+
+# Run only specific plugins for this scan, regardless of config.yaml's enabled flags
+stelarstrike scan "https://target.example.com/" --plugins sqli,xss
+
+# See every request/payload each plugin tries — use this when a scan
+# finds nothing and you need to see what actually happened
+stelarstrike scan "https://target.example.com/" --plugins sqli --verbose
 ```
+
+`--plugins` is a one-off override for a single run — it doesn't change `config.yaml`. Omit it and StelarStrike runs whatever's enabled in your config (all 8, by default). Use `--plugins` when you want to iterate quickly on one vulnerability class (e.g. tuning `sqli` against a specific target) without editing the config file each time.
 
 Sample output:
 
@@ -384,6 +396,19 @@ PLUGIN_REGISTRY["your_vuln"] = YourVulnPlugin
 3. Add a matching section to `config/config.example.yaml` under `plugins:`.
 
 That's it — the orchestrator, CLI, and reporting layer all pick it up automatically through `PLUGIN_REGISTRY`.
+
+## Debugging a scan that finds nothing
+
+If a scan comes back empty and you expected findings, work through this in order:
+
+1. **Run with `--verbose`.** This is the fastest diagnostic — it logs every payload each plugin sends and the response it got back, so you can see exactly what was tried instead of guessing:
+   ```bash
+   stelarstrike scan "http://target/" --plugins sqli --verbose
+   ```
+2. **Check the `Discovery: scanning N URL(s): [...]` log line.** If discovery only found the bare URL you passed (no `?id=`, `?q=`, etc.), the target may not expose links/forms the crawler can see from that starting page — point `scan` directly at a page with a form or parameter instead (a login page, search box, product page), or increase `discovery.max_depth`/`max_urls` in `config.yaml`.
+3. **Confirm `allow_active_payloads` matches what you actually want tested.** Time-blind SQLi, UNION confirmation, and auth-bypass checks all require it to be `true`. Passive-only (`false`) will legitimately find nothing on a target whose only vulnerability requires an active probe.
+4. **If it's SQLi specifically:** the target's DBMS matters. `sqli` tries MySQL/PostgreSQL/MSSQL/SQLite/Oracle signatures and time-based payloads, but an unusual or heavily customized error-handling setup can still swallow every signal. `--verbose` will show you the raw response bodies coming back so you can add a missing signature yourself if needed (`_ERROR_SIGNATURES` in `stelarstrike/plugins/sqli.py`).
+5. **Check you're actually reaching the target at all.** A silently-failing connection (wrong port, target down, VPN/lab not connected) looks identical to "no vulnerabilities found" unless you're watching `--verbose` output for connection errors.
 
 ## Testing
 
