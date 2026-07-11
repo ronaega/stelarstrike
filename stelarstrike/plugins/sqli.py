@@ -47,22 +47,15 @@ checked against a baseline (unmodified) request first — if the
 all, it's almost certainly WAF/app noise, not SQLi, and is skipped.
 
 --------------------------------------------------------------------
-What this plugin intentionally does NOT do, even with
-allow_active_payloads: true:
-  - It does not extract table/column names or row data via UNION
-    (version(), string_agg(), information_schema queries, etc.).
-    Confirming injectability + column count is enough to prove the
-    vulnerability and hand off to a human for authorized, scoped
-    extraction (e.g. sqlmap under your own supervision) — actually
-    pulling credentials or user data is a materially bigger action
-    than "detect a vulnerability" and isn't something this scanner
-    takes automatically.
+What this plugin intentionally does NOT do:
   - It does not attempt second-order SQLi (register a payload, then
     trigger it later via login). That requires creating persistent
-    accounts/data on the target and chaining two separate write
-    operations together, which is a meaningfully more invasive,
-    stateful action than every other check in this plugin — worth
-    doing by hand, with your eyes on each step, not automated.
+    accounts/data on the target — worth doing by hand, not automated.
+  - Data extraction (UNION-based schema/row dumping) is now opt-in via
+    `plugins.sqli.extraction.enabled: true` in config.yaml, and requires
+    `engagement.allow_active_payloads: true`. When enabled, the
+    SQLiExtractor module in sqli_extract.py handles the extraction phase
+    after a field is confirmed injectable.
 --------------------------------------------------------------------
 """
 
@@ -73,6 +66,7 @@ import time
 
 from stelarstrike.core.report import Finding
 from stelarstrike.plugins.base import VulnerabilityPlugin
+from stelarstrike.plugins.sqli_extract import SQLiExtractor
 from stelarstrike.utils.http_client import build_url_with_params, extract_forms, get_query_params
 from stelarstrike.utils.logger import get_logger
 
@@ -132,6 +126,20 @@ _LOGIN_FAILURE_KEYWORDS = ["invalid", "incorrect", "failed", "denied", "wrong pa
 _LOGIN_SUCCESS_KEYWORDS = ["welcome", "dashboard", "logout", "\"success\"", "'success'", "token"]
 
 _DYNAMIC_CONTENT_RE = re.compile(r"\d{8,}")  # strips long digit runs: timestamps, nonces, session-ish IDs
+
+_DB_FINGERPRINTS: dict[str, list[str]] = {
+    "postgresql": ["pg_query", "pg_exec", "syntax error at or near", "pg_sleep", "unterminated quoted string"],
+    "mysql":      ["warning: mysql", "mysql_fetch", "check the manual", "you have an error in your sql syntax"],
+    "mssql":      ["microsoft ole db provider", "incorrect syntax near", "waitfor delay", "sqlstate"],
+    "sqlite":     ["sqlite3.operationalerror", "no such table", "sqlite_master"],
+}
+
+
+def _fingerprint_db(body_lower: str) -> str | None:
+    for db, patterns in _DB_FINGERPRINTS.items():
+        if any(p in body_lower for p in patterns):
+            return db
+    return None
 
 
 class SQLiPlugin(VulnerabilityPlugin):
@@ -240,20 +248,73 @@ class SQLiPlugin(VulnerabilityPlugin):
                     )
                     if union_f:
                         findings.append(union_f)
+                    await self._run_extraction(findings, url, method, body_type, base_values, field, f.extra.get("db_type"))
                 return findings  # confirmed — skip blind checks on this field
 
         if "boolean-blind" in techniques:
             f = await self._check_boolean_blind(vector_label, url, method, body_type, base_values, field)
             if f:
                 findings.append(f)
+                if self.ctx.allow_active_payloads:
+                    await self._run_extraction(findings, url, method, body_type, base_values, field, f.extra.get("db_type"))
                 return findings
 
         if "time-blind" in techniques and self.ctx.allow_active_payloads:
             f = await self._check_time_blind(vector_label, url, method, body_type, base_values, field)
             if f:
                 findings.append(f)
+                await self._run_extraction(findings, url, method, body_type, base_values, field, f.extra.get("db_type"))
 
         return findings
+
+    async def _run_extraction(
+        self,
+        findings: list[Finding],
+        url: str,
+        method: str,
+        body_type: str,
+        base_values: dict[str, str],
+        field: str,
+        db_type: str | None,
+    ) -> None:
+        """Run data extraction against a confirmed-injectable field, if enabled in config."""
+        extraction_cfg = self.options.get("extraction", {})
+        if not extraction_cfg.get("enabled", False):
+            return
+
+        log.info(f"sqli: extraction enabled — starting extraction on '{field}' ({db_type or 'postgresql'})")
+
+        async def inject_fn(payload: str) -> str:
+            test_values = dict(base_values)
+            test_values[field] = f"{base_values[field]}{payload}"
+            try:
+                resp = await self._send(url, method, body_type, test_values)
+                return resp.text
+            except Exception:  # noqa: BLE001
+                return ""
+
+        try:
+            extractor = SQLiExtractor(
+                inject_fn=inject_fn,
+                db_type=db_type or "postgresql",
+                config=extraction_cfg,
+            )
+            result = await extractor.run()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"sqli: extraction failed for '{field}': {exc}")
+            return
+
+        if not result.tables and not result.db_version:
+            log.debug(f"sqli: extraction produced no data for '{field}'")
+            return
+
+        # Append extraction summary to the most-recent confirmed finding for this field
+        for finding in reversed(findings):
+            if finding.parameter == field:
+                finding.evidence = (finding.evidence or "") + f"\n\n--- Extracted Data ---\n{result.summary()}"
+                finding.extracted_data = result.to_dict()
+                log.info(f"sqli: extraction complete — {len(result.tables)} table(s) found")
+                break
 
     async def _send(self, url: str, method: str, body_type: str, values: dict[str, str]):
         if method == "get":
@@ -298,7 +359,8 @@ class SQLiPlugin(VulnerabilityPlugin):
                             f"{vector_label} — false positive, skipping."
                         )
                         continue
-                    return self.finding(
+                    db_type = _fingerprint_db(body_lower)
+                    f = self.finding(
                         title=f"SQL Injection (error-based, {context} context)",
                         url=url,
                         parameter=field,
@@ -308,11 +370,14 @@ class SQLiPlugin(VulnerabilityPlugin):
                             f"SQL-metacharacter payload is injected, and the same "
                             f"error does not appear in the unmodified baseline "
                             f"request — unsanitized input reaches a SQL query."
+                            + (f" DB fingerprint: {db_type}." if db_type else "")
                         ),
                         remediation="Use parameterized queries / prepared statements. Never concatenate user input into SQL.",
                         confidence="high",
                         cwe="CWE-89",
                     )
+                    f.extra["db_type"] = db_type
+                    return f
         return None
 
     async def _check_boolean_blind(

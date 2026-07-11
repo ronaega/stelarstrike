@@ -22,6 +22,7 @@ class Finding:
     confidence: str = "medium"   # low | medium | high | confirmed
     cwe: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    extracted_data: dict | None = None  # structured data from SQLi extraction; JSON report only
 
 
 class ReportBuilder:

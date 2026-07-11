@@ -231,3 +231,35 @@ Ordered roughly by expected value; not a committed timeline.
 - **2026-07-10 (2)** — `sqli` rewritten (v3): tests query params and every form field, POST as both form-encoded and JSON body; multi-DBMS error signatures + framework debug-page leaks; baseline false-positive filtering; dual-payload-verified boolean-blind with dynamic-content stripping; login-form auth-bypass detection; bounded UNION column-count confirmation (detection only, no data extraction). Added `stelarstrike scan --plugins id1,id2` (one-off plugin selection override) and `--verbose` (full request/payload debug logging) CLI flags.
 - **2026-07-10** — Auto-discovery pulled forward from the v1.3 roadmap into v1.0: `core/discovery.py` crawls same-origin links/forms one level deep and falls back to synthetic common parameter names, so `scan` no longer requires the user to manually supply a query parameter. Orchestrator now fans plugins out across every discovered (in-scope) URL. Added the CLI startup banner.
 - **2026-07-09** — v1.0 initial PRD + implementation: 8 plugins (sqli, nosqli, xss, ssrf, csrf, file_upload, idor, jwt), config system, AI layer via LiteLLM, Markdown/JSON reporting, Docker + GitHub Actions CI.
+
+---
+
+## 🔖 Last Change
+
+> This section is overwritten every session to reflect the single most recent change. Use the Change Log (§10) for full history.
+
+**Date:** 2026-07-11
+**Changed by:** Rona (via Claude)
+
+**What changed:**
+- `stelarstrike/plugins/sqli_extract.py` — new standalone extraction engine. After `sqli` confirms a parameter is injectable, `SQLiExtractor` runs a UNION-based extraction pipeline: auto-enumerates column count (1–15), fingerprints DB type (PostgreSQL/MySQL/MSSQL/SQLite), extracts DB version, all table names, column names per table, and sample rows from tables matching high-value keywords (user, admin, auth, session, token, payment, etc.). No HTTP calls inside the module itself — it receives an `inject_fn` callback from the plugin (keeps it independently testable).
+- `stelarstrike/plugins/sqli.py` — added `_run_extraction()` phase in `_test_vector()`: fires after any detection technique confirms injectability (error-based, boolean-blind, or time-blind), passes a vector-specific `inject_fn` to `SQLiExtractor`, then appends the human-readable `result.summary()` to `Finding.evidence` and the structured dict to `Finding.extracted_data`. Added `_fingerprint_db()` at module level + `_DB_FINGERPRINTS` dict; error-based now stores detected DB type in `finding.extra["db_type"]` so extraction can use it.
+- `stelarstrike/core/report.py` — added `extracted_data: dict | None = None` field to `Finding` dataclass; appears in JSON report output, ignored by Markdown (evidence field carries the human-readable summary instead).
+- `config/config.example.yaml` — added `plugins.sqli.extraction` sub-section (`enabled: false` by default, requires `engagement.allow_active_payloads: true` to run).
+- `tests/test_sqli_extract.py` — 6 new regression tests: version extraction, table discovery, column count enumeration (proves 4-attempt retry), extraction disabled by default, high-value table ranking, `ExtractionResult` summary/dict format.
+- All 19 tests pass.
+
+**To enable extraction in your scan:**
+```yaml
+# config/config.yaml
+engagement:
+  allow_active_payloads: true
+plugins:
+  sqli:
+    extraction:
+      enabled: true
+```
+```bash
+stelarstrike scan "http://194.233.89.48:5000/" --plugins sqli --verbose
+```
+

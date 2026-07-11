@@ -51,6 +51,27 @@ plugins:
     enabled: true
     techniques: ["error-based", "boolean-blind", "time-blind"]
     time_delay_seconds: 5
+    # Data extraction — only runs when BOTH of these are true:
+    #   1. extraction.enabled is true here
+    #   2. engagement.allow_active_payloads is true
+    # When enabled, after confirming SQLi the plugin automatically:
+    #   - fingerprints the DB type
+    #   - extracts DB version
+    #   - enumerates all table names
+    #   - extracts column names per table
+    #   - dumps sample rows from high-value tables (users, auth, sessions, etc.)
+    # Results appear in Finding.evidence (Markdown report) and Finding.extracted_data (JSON report).
+    extraction:
+      enabled: false                   # set true to enable autonomous data extraction
+      max_tables: 20                   # max tables to enumerate
+      max_columns_per_table: 30        # max columns per table
+      max_rows_per_table: 50           # max rows to sample per high-value table
+      extract:
+        - "version"                    # extract DB version string
+        - "schema"                     # extract table + column names
+        # tables are auto-discovered and auto-prioritised by name heuristics
+        # (user, admin, auth, login, token, session, payment, etc.)
+        # no hardcoded table names needed
   nosqli:
     enabled: true
     dbms_hints: ["mongodb"]
