@@ -25,6 +25,7 @@
 - [v1.0 Scope](#v10-scope)
 - [Architecture](#architecture)
 - [Installation](#installation)
+- [Updating](#updating)
 - [Configuration](#configuration)
   - [1. Environment variables (`.env`)](#1-environment-variables-env)
   - [2. Main config (`config/config.yaml`)](#2-main-config-configconfigyaml)
@@ -120,6 +121,34 @@ Verify the install:
 stelarstrike --help
 stelarstrike plugins
 ```
+
+## Updating
+
+If you already cloned this repo and want to pull in the latest changes:
+
+```bash
+git pull origin main
+pip install -e ".[dev]"    # picks up any new/changed dependencies
+```
+
+A few notes:
+
+- **If `git pull` complains about local changes**, it means you've edited a tracked file (e.g. `README.md`, `pyproject.toml`). Your `config/config.yaml` and `.env` are git-ignored, so they're never affected by this. To handle local edits:
+  ```bash
+  git stash          # temporarily shelve your local edits
+  git pull origin main
+  git stash pop       # reapply your edits on top of the update
+  ```
+- **To see what changed before pulling:**
+  ```bash
+  git fetch origin
+  git log HEAD..origin/main --oneline
+  ```
+- **After updating, check `config/config.example.yaml` and `.env.example` for new keys** — an update may add config options (like `discovery:` or new plugin settings) that won't automatically appear in your own `config.yaml`/`.env` since those are your local, git-ignored copies. Diff them manually:
+  ```bash
+  diff config/config.yaml config/config.example.yaml
+  diff .env .env.example
+  ```
 
 ## Configuration
 
