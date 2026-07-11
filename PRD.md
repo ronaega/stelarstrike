@@ -241,15 +241,21 @@ Ordered roughly by expected value; not a committed timeline.
 **Date:** 2026-07-11
 **Changed by:** Rona (via Claude)
 
-**What changed:**
-- `stelarstrike/plugins/sqli_extract.py` — new standalone extraction engine. After `sqli` confirms a parameter is injectable, `SQLiExtractor` runs a UNION-based extraction pipeline: auto-enumerates column count (1–15), fingerprints DB type (PostgreSQL/MySQL/MSSQL/SQLite), extracts DB version, all table names, column names per table, and sample rows from tables matching high-value keywords (user, admin, auth, session, token, payment, etc.). No HTTP calls inside the module itself — it receives an `inject_fn` callback from the plugin (keeps it independently testable).
-- `stelarstrike/plugins/sqli.py` — added `_run_extraction()` phase in `_test_vector()`: fires after any detection technique confirms injectability (error-based, boolean-blind, or time-blind), passes a vector-specific `inject_fn` to `SQLiExtractor`, then appends the human-readable `result.summary()` to `Finding.evidence` and the structured dict to `Finding.extracted_data`. Added `_fingerprint_db()` at module level + `_DB_FINGERPRINTS` dict; error-based now stores detected DB type in `finding.extra["db_type"]` so extraction can use it.
-- `stelarstrike/core/report.py` — added `extracted_data: dict | None = None` field to `Finding` dataclass; appears in JSON report output, ignored by Markdown (evidence field carries the human-readable summary instead).
-- `config/config.example.yaml` — added `plugins.sqli.extraction` sub-section (`enabled: false` by default, requires `engagement.allow_active_payloads: true` to run).
-- `tests/test_sqli_extract.py` — 6 new regression tests: version extraction, table discovery, column count enumeration (proves 4-attempt retry), extraction disabled by default, high-value table ranking, `ExtractionResult` summary/dict format.
-- All 19 tests pass.
+**What changed — SQLi extraction engine rebuilt (sentinel-based):**
 
-**To enable extraction in your scan:**
+Root cause of extraction returning nothing: `_extract_value` had no way to distinguish the injected value from regular HTML content (nav links, CSS classes, etc.) — it just grabbed any long string it found, which was rarely the right one.
+
+Fixes in `stelarstrike/plugins/sqli_extract.py`:
+- **Sentinel markers** (`STELR0...0RLETS`) — injected value is now wrapped with unique delimiters using DB-appropriate concat syntax (`||` for PostgreSQL/SQLite, `CONCAT()` for MySQL, `+` for MSSQL). `_extract_value` searches for `STELR0...0RLETS` first — if found, that's the value, regardless of surrounding HTML noise.
+- **`_compat_cols` now uses `NULL`** for all DBs — previously used `'1','2'` string literals which caused type mismatch errors in PostgreSQL's strict type system.
+- **`_union_scalar` tries three prefix contexts** — string (`'`), space/numeric (` `), and closing-paren (`')`), stopping at the first that gets the sentinel back. Column count mismatch responses now correctly break out to try the next count rather than the next prefix.
+- **Debug logging throughout** — every UNION probe attempt logs `col_count`, `prefix`, and whether the sentinel was found, so `--verbose` now shows exactly where extraction stalls.
+- `_extract_value` fallback chain: sentinel → JSON longest-string → very conservative regex (only returns if exactly one unambiguous match).
+- `tests/test_sqli_extract.py` fully rewritten — 13 tests, all sentinel-aware mocks.
+
+**All 26 tests pass.**
+
+**To run extraction against your lab:**
 ```yaml
 # config/config.yaml
 engagement:
@@ -262,4 +268,6 @@ plugins:
 ```bash
 stelarstrike scan "http://194.233.89.48:5000/" --plugins sqli --verbose
 ```
+`--verbose` now shows every UNION probe the extractor attempts so you can see exactly what it's doing.
+
 

