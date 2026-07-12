@@ -61,41 +61,45 @@ class Orchestrator:
         ) as http_client:
             semaphore = asyncio.Semaphore(self.settings.http.max_concurrency)
 
-            # Schema matching — check against known target patterns before discovery.
-            # A match skips column-count enumeration and goes straight to known parameters.
+            # Schema pattern matching — check against generic stack patterns (Flask, Django, etc.)
+            # A match ADDS probe endpoints and GUIDES enumeration — never bypasses it.
             self.matched_schema = await match_schema(target_url, http_client)
             if self.matched_schema:
                 log.info(self.matched_schema.summary())
 
             target_urls = [target_url]
             if self.settings.discovery.enabled:
-                # If schema provides known endpoints, also scan those directly.
+                # Always run discovery
+                discovered = await discover_targets(
+                    base_url=target_url,
+                    http_client=http_client,
+                    scope=self.settings.engagement.scope,
+                    out_of_scope=self.settings.engagement.out_of_scope,
+                    max_urls=self.settings.discovery.max_urls,
+                    max_depth=self.settings.discovery.max_depth,
+                    synthetic_params=self.settings.discovery.synthetic_params,
+                )
+                target_urls = list(dict.fromkeys(discovered))
+
+                # Schema matched — also add its pattern probe endpoints (alongside discovery)
                 if self.matched_schema:
                     base_host = target_url.rstrip("/")
-                    for ep in self.matched_schema.endpoints:
-                        if not ep.get("auth_required", False) and ep.get("method") in ("GET", "POST"):
-                            ep_url = base_host + ep["path"]
-                            if ep_url not in target_urls:
-                                target_urls.append(ep_url)
-                    log.info(f"Schema: added {len(target_urls) - 1} known endpoint(s) to scan queue")
-                else:
-                    target_urls = await discover_targets(
-                        base_url=target_url,
-                        http_client=http_client,
-                        scope=self.settings.engagement.scope,
-                        out_of_scope=self.settings.engagement.out_of_scope,
-                        max_urls=self.settings.discovery.max_urls,
-                        max_depth=self.settings.discovery.max_depth,
-                        synthetic_params=self.settings.discovery.synthetic_params,
-                    )
-                    log.info(f"Discovery: scanning {len(target_urls)} URL(s): {target_urls}")
+                    added = 0
+                    for ep in self.matched_schema.probe_endpoints:
+                        ep_url = base_host + ep["path"]
+                        if ep_url not in target_urls:
+                            target_urls.append(ep_url)
+                            added += 1
+                    if added:
+                        log.info(f"Schema: added {added} pattern endpoint(s) to scan queue")
 
-            # Build schema hints for plugins that support them (e.g. sqli)
-            schema_hints: dict[str, Any] = {}
+                log.info(f"Discovery + Schema: scanning {len(target_urls)} URL(s)")
+
+            # Schema provides category-level sqli hints (positions to try first, likely DB).
+            # These are soft hints — the extractor still runs full enumeration if they miss.
+            schema_sqli_hints: dict[str, Any] = {}
             if self.matched_schema:
-                sqli_hints = self.matched_schema.get_sqli_hints()
-                if sqli_hints:
-                    schema_hints["sqli_hints"] = sqli_hints
+                schema_sqli_hints = self.matched_schema.get_sqli_hints()
 
             tasks = []
             for url in target_urls:
@@ -110,10 +114,14 @@ class Orchestrator:
                         if plugin_cfg is None or not plugin_cfg.enabled:
                             continue
 
-                    # Merge schema hints into plugin options (schema wins for known parameters)
                     merged_options = {**plugin_cfg.options}
-                    if plugin_id == "sqli" and "sqli_hints" in schema_hints:
-                        merged_options["schema_hints"] = schema_hints["sqli_hints"]
+                    if plugin_id == "sqli":
+                        if schema_sqli_hints:
+                            merged_options["schema_hints"] = schema_sqli_hints
+                        merged_options["_ai_config"] = {
+                            "enabled": self.settings.ai.enabled,
+                            "provider": self.settings.ai.provider,
+                        }
 
                     ctx = PluginContext(
                         target=url_target,

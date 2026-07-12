@@ -1,0 +1,62 @@
+# Generic pattern: Python Flask web application backed by PostgreSQL
+# Matches ANY Flask+PostgreSQL app, not any specific target.
+# Add to this file as you encounter new Flask apps with similar patterns.
+
+name: "Python Flask + PostgreSQL Web Application"
+description: >
+  Generic pattern for Python Flask web applications using PostgreSQL.
+  Common in bootcamp/course labs, CTF challenges, and small-to-medium
+  commercial apps. Typically uses Werkzeug as the WSGI toolkit.
+
+# OR logic — matches if ANY ONE fingerprint is found
+fingerprints:
+  - header_contains: "Werkzeug"
+  - header_contains: "python"
+  - response_contains: "Powered by Flask"
+
+probe_endpoints:
+  - path: "/login"
+    method: "POST"
+    body_types: ["json", "form"]
+    injectable_fields: ["username", "email", "user", "login"]
+  - path: "/api/login"
+    method: "POST"
+    body_types: ["json"]
+    injectable_fields: ["username", "email"]
+  - path: "/register"
+    method: "POST"
+    body_types: ["json", "form"]
+    injectable_fields: ["username", "email"]
+  - path: "/api/register"
+    method: "POST"
+    body_types: ["json"]
+  - path: "/search"
+    method: "GET"
+    injectable_fields: ["q", "query", "search", "keyword"]
+  - path: "/api/users"
+    method: "GET"
+  - path: "/admin"
+    method: "GET"
+  - path: "/console"
+    method: "GET"
+  - path: "/dashboard"
+    method: "GET"
+
+sqli:
+  likely_db: "postgresql"
+  # PostgreSQL login forms commonly have id (int) then text columns.
+  # Position 1 (the first text column, often username) is most commonly reflected.
+  try_positions_first: [1, 0, 2, 3]
+  col_count_hint: 8  # typical range: 5-15, start at 8
+
+extra_checks:
+  - name: "Werkzeug Debug Console Exposed"
+    path: "/console"
+    indicator: "Werkzeug Debugger"
+    severity: "critical"
+  - name: "Flask Debug Traceback in 500 Response"
+    indicator: "Traceback (most recent call last)"
+    severity: "high"
+  - name: "Debug Info Leakage in JSON Response"
+    indicator: "debug_info"
+    severity: "medium"

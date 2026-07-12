@@ -54,45 +54,49 @@ def _make_preconfigured_extractor(inject_responses: dict, db_type: str = "postgr
 def _make_discovery_extractor(col_count: int, reflected_pos: int,
                               db_type: str = "postgresql") -> SQLiExtractor:
     """
-    Extractor that simulates full two-phase discovery.
-    `sentinel_response_fn(subquery_value) -> response_str` is called when
-    the sentinel lands on the right position.
+    Simulates a target with known col_count and reflected_pos.
+    Handles all three phases: Phase 1 NULL probe, Phase 2 literal probe, Phase 3 sentinel.
     """
     MISMATCH = "each union query must have the same number of columns"
     TYPE_ERR = "invalid input syntax for type integer"
+    LITERAL = SQLiExtractor._LITERAL_PROBE
+    _S = SQLiExtractor._SENTINEL_START
 
     async def mock_inject(payload: str) -> str:
         p = payload.lower()
-
-        # Count columns in the UNION SELECT clause
         m = _re.search(r"union select (.+?)(?:--|#|$)", p)
         if not m:
             return '{"error": "no union"}'
-        cols_str = m.group(1)
-        cols = [c.strip() for c in cols_str.split(",")]
+        cols = [c.strip() for c in m.group(1).split(",")]
         n = len(cols)
 
         if n != col_count:
             return f'{{"error": "{MISMATCH}"}}'
 
-        # NULL-only probe (phase 1) — just confirm the column count
+        # Phase 1: NULL-only probe
         if all(c == "null" for c in cols):
             return '{"message": "null probe ok"}'
 
-        # Sentinel probe (phase 2) — check which position has the sentinel
+        # Phase 2: Literal probe (STELRPROBE)
         for i, col in enumerate(cols):
-            if s.lower() in col:
+            if LITERAL.lower() in col:
                 if i == reflected_pos:
-                    # Extract the subquery from the sentinel wrapper
+                    return f'{{"username": "{LITERAL}", "token": "eyJ..."}}' 
+                elif i == 0 and reflected_pos != 0:
+                    return f'{{"error": "{TYPE_ERR}"}}'
+                return '{"message": "not reflected here"}'
+
+        # Phase 3: Sentinel probe
+        for i, col in enumerate(cols):
+            if _S.lower() in col:
+                if i == reflected_pos:
                     return _wrap(f"extracted_value_{i}")
                 elif i == 0 and reflected_pos != 0:
                     return f'{{"error": "{TYPE_ERR}"}}'
-                else:
-                    return '{"message": "not reflected here"}'
+                return '{"message": "not reflected here"}'
 
         return '{"message": "ok"}'
 
-    s = S.lower()
     ext = SQLiExtractor(
         inject_fn=mock_inject,
         db_type=db_type,
@@ -160,6 +164,7 @@ async def test_discovery_type_error_forces_next_position():
     """
     TYPE_ERR = "invalid input syntax for type integer"
     MISMATCH = "each union query must have the same number of columns"
+    LITERAL = SQLiExtractor._LITERAL_PROBE
 
     async def mock_inject(payload: str) -> str:
         p = payload.lower()
@@ -171,6 +176,15 @@ async def test_discovery_type_error_forces_next_position():
             return f'{{"error": "{MISMATCH}"}}'
         if all(c == "null" for c in cols):
             return '{"ok": true}'
+        # Phase 2: literal probe
+        for i, c in enumerate(cols):
+            if LITERAL.lower() in c:
+                if i == 0:
+                    return f'{{"error": "{TYPE_ERR}"}}'
+                if i == 1:
+                    return f'{{"username": "{LITERAL}"}}'
+                return '{"message": "nothing"}'
+        # Phase 3: sentinel probe
         for i, c in enumerate(cols):
             if "stelr0" in c:
                 if i == 0:

@@ -221,6 +221,16 @@ class SQLiPlugin(VulnerabilityPlugin):
                         )
                         if f:
                             findings.append(f)
+                            # Auth bypass confirms the field is injectable — trigger extraction.
+                            # This is the path the previous version missed: _run_extraction
+                            # was only called from _test_vector, but auth bypass is detected
+                            # here directly and never went through that path.
+                            if self.ctx.allow_active_payloads:
+                                await self._run_extraction(
+                                    findings, action_url, form["method"], body_type,
+                                    base_values, username_field,
+                                    db_type=None,  # schema hints applied inside
+                                )
                             break  # confirmed via one encoding, no need to double-report
 
         return findings
@@ -294,28 +304,43 @@ class SQLiPlugin(VulnerabilityPlugin):
                 return ""
 
         try:
+            # Build a simple AI completion function from LiteLLM if AI is configured
+            ai_completion = None
+            ai_cfg = self.options.get("_ai_config")
+            if ai_cfg and ai_cfg.get("enabled"):
+                try:
+                    import litellm as _litellm
+                    def ai_completion(prompt: str) -> str:
+                        resp = _litellm.completion(
+                            model=ai_cfg.get("provider", "openai/gpt-4o-mini"),
+                            max_tokens=500,
+                            temperature=0,
+                            messages=[{"role": "user", "content": prompt}],
+                        )
+                        return resp["choices"][0]["message"]["content"]
+                except Exception:
+                    pass
+
             extractor = SQLiExtractor(
                 inject_fn=inject_fn,
                 db_type=db_type or "postgresql",
                 config=extraction_cfg,
+                ai_client=ai_completion,
             )
 
-            # Apply schema hints if available — skips column-count discovery
-            schema_hints = self.options.get("schema_hints")
+            # Apply schema category hints — guides (not replaces) enumeration
+            schema_hints = self.options.get("schema_hints", {})
             if schema_hints:
-                if "col_count" in schema_hints:
-                    extractor._col_count = schema_hints["col_count"]
-                    log.info(f"sqli: schema hint applied — col_count={extractor._col_count}")
-                if "reflected_col" in schema_hints:
-                    extractor._reflected_col = schema_hints["reflected_col"]
-                    log.info(f"sqli: schema hint applied — reflected_col={extractor._reflected_col}")
-                if "inject_prefix" in schema_hints:
-                    extractor._inject_prefix = schema_hints["inject_prefix"]
-                if "db_type" in schema_hints and not db_type:
-                    extractor.db_type = schema_hints["db_type"]
-                    extractor.db = __import__(
-                        "stelarstrike.plugins.sqli_extract", fromlist=["_DB_BUILDERS"]
-                    )._DB_BUILDERS.get(extractor.db_type, extractor.db)
+                # try_positions_first: extractor probes these positions before exhaustive search
+                if "try_positions_first" in schema_hints:
+                    extractor._try_positions_first = schema_hints["try_positions_first"]
+                    log.info(f"sqli: schema hint — try positions first: {extractor._try_positions_first}")
+                # likely_db: default DB type assumption if fingerprinting didn't find one
+                if "likely_db" in schema_hints and not db_type:
+                    extractor.db_type = schema_hints["likely_db"]
+                    from stelarstrike.plugins.sqli_extract import _DB_BUILDERS
+                    extractor.db = _DB_BUILDERS.get(extractor.db_type, extractor.db)
+                    log.info(f"sqli: schema hint — likely_db={extractor.db_type}")
 
             result = await extractor.run()
         except Exception as exc:  # noqa: BLE001
@@ -437,31 +462,50 @@ class SQLiPlugin(VulnerabilityPlugin):
             true2_clean = self._strip_dynamic(true2_resp.text)
             false_clean = self._strip_dynamic(false_resp.text)
 
-            true_pair_consistent = (
-                true1_resp.status_code == true2_resp.status_code and true1_clean == true2_clean
-            )
+            # Consistency check — use STATUS CODE as primary signal, not body equality.
+            # Reason: JWT tokens, nonces, or CSRF tokens in responses change on every
+            # request, making true1_clean != true2_clean even when both are genuinely
+            # TRUE responses. A matching status code is the reliable consistency signal.
+            true_pair_consistent = true1_resp.status_code == true2_resp.status_code
             if not true_pair_consistent:
-                log.debug(f"sqli: {vector_label} TRUE1 != TRUE2 — inconsistent, skipping (noisy target).")
+                log.debug(
+                    f"sqli: {vector_label} TRUE1 status={true1_resp.status_code} "
+                    f"!= TRUE2 status={true2_resp.status_code} — skipping."
+                )
                 continue
 
             status_differs = true1_resp.status_code != false_resp.status_code
-            content_differs = true1_clean != false_clean
+            # Body comparison: only meaningful if responses don't contain tokens/nonces.
+            # Use length difference as a proxy (avoids false-positive from identical errors).
+            length_ratio = (
+                len(true1_clean) / max(len(false_clean), 1)
+            )
+            content_differs = true1_clean != false_clean and (length_ratio < 0.7 or length_ratio > 1.4)
             keyword_differs = ("error" in false_clean.lower()) != ("error" in true1_clean.lower())
+            success_keyword_differs = (
+                any(kw in true1_clean.lower() for kw in ("token", "welcome", "dashboard", "success"))
+                and not any(kw in false_clean.lower() for kw in ("token", "welcome", "dashboard", "success"))
+            )
 
-            if status_differs or content_differs or keyword_differs:
+            log.debug(
+                f"sqli: boolean-blind {vector_label} [{context}]: "
+                f"status_differs={status_differs}, content_differs={content_differs}, "
+                f"keyword_differs={keyword_differs}, success_kw_differs={success_keyword_differs}"
+            )
+
+            if status_differs or content_differs or keyword_differs or success_keyword_differs:
                 return self.finding(
                     title=f"SQL Injection (boolean-blind, {context} context)",
                     url=url,
                     parameter=field,
                     evidence=(
-                        f"{vector_label}: TRUE (2 consistent payloads) -> HTTP {true1_resp.status_code}/{len(true1_resp.text)}b, "
+                        f"{vector_label}: TRUE -> HTTP {true1_resp.status_code}/{len(true1_resp.text)}b, "
                         f"FALSE -> HTTP {false_resp.status_code}/{len(false_resp.text)}b"
                     ),
                     description=(
-                        f"{vector_label} produces a measurably different, "
-                        f"internally-consistent response for logically-true vs. "
-                        f"logically-false injected conditions (verified with two "
-                        f"different TRUE payloads), suggesting blind SQL injection."
+                        f"{vector_label} produces a measurably different response "
+                        f"for logically-true vs. logically-false injected conditions, "
+                        f"suggesting blind SQL injection."
                     ),
                     remediation="Use parameterized queries / prepared statements.",
                     confidence="medium",

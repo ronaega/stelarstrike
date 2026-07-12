@@ -25,6 +25,7 @@
 - [v1.0 Scope](#v10-scope)
 - [Architecture](#architecture)
 - [Installation](#installation)
+- [Uninstalling](#uninstalling)
 - [Updating](#updating)
 - [Configuration](#configuration)
   - [1. Environment variables (`.env`)](#1-environment-variables-env)
@@ -120,6 +121,35 @@ Verify the install:
 ```bash
 stelarstrike --help
 stelarstrike plugins
+```
+
+## Uninstalling
+
+To fully remove StelarStrike:
+
+```bash
+# 1. Deactivate the virtual environment (if active)
+deactivate
+
+# 2. Remove the project folder (contains the code, venv, reports, config)
+rm -rf /path/to/stelarstrike
+
+# 3. If you installed globally (without a venv), uninstall the package
+pip uninstall stelarstrike -y
+```
+
+If you only want to remove the package from a virtual environment but keep the folder:
+
+```bash
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip uninstall stelarstrike -y
+```
+
+To confirm it's gone:
+
+```bash
+stelarstrike --help   # should return "command not found"
+pip show stelarstrike  # should return nothing
 ```
 
 ## Updating

@@ -1,23 +1,15 @@
 """
 Alternative Schema Loader.
 
-Loads YAML schema files from the `schemas/` directory, fingerprints
-the target against each one, and — on a match — provides known
-injection parameters to the scan so it can skip slow discovery and
-column-count enumeration.
+Schemas are generic PATTERN files (Flask+PostgreSQL, Django REST, etc.) —
+they are NOT named after or tied to specific targets.
 
-Benefit 1 — Speed: skips 20–100+ HTTP requests on a schema match.
-Benefit 2 — AI tokens: skip triage call when findings are already
-  documented in the schema's `additional_findings`.
-Benefit 3 — Accuracy: uses confirmed column count + reflected position
-  directly, so extraction works first try instead of probing.
+When a target matches a pattern, the orchestrator:
+  1. Adds the pattern's probe_endpoints to the scan queue (alongside discovery)
+  2. Passes sqli.try_positions_first to guide extraction (not bypass it)
+  3. Notes extra_checks for the scan report
 
-Usage in orchestrator:
-
-    schema = await match_schema(target_url, http_client)
-    if schema:
-        # Feed known sqli parameters directly to SQLiExtractor
-        sqli_hints = schema.get_sqli_hints("login_username_sqli")
+Fingerprinting uses OR logic — a target matches if ANY ONE fingerprint fires.
 """
 
 from __future__ import annotations
@@ -41,48 +33,25 @@ _SCHEMAS_DIR = Path(__file__).parent.parent.parent / "schemas"
 class SchemaMatch:
     name: str
     description: str
-    source: str
-    stack: dict[str, str] = field(default_factory=dict)
-    injections: list[dict[str, Any]] = field(default_factory=list)
-    endpoints: list[dict[str, Any]] = field(default_factory=list)
-    additional_findings: list[dict[str, Any]] = field(default_factory=list)
-    raw: dict[str, Any] = field(default_factory=dict)
+    probe_endpoints: list[dict[str, Any]] = field(default_factory=list)
+    sqli_hints: dict[str, Any] = field(default_factory=dict)
+    extra_checks: list[dict[str, Any]] = field(default_factory=list)
+    matched_fingerprint: str = ""
 
-    def get_sqli_hints(self, injection_id: str | None = None) -> dict[str, Any] | None:
-        """
-        Return the sqli sub-dict for the specified injection id, or the first
-        confirmed sqli injection if no id is given.
-
-        Callers can use this to pre-configure SQLiExtractor:
-            hints = schema.get_sqli_hints()
-            if hints:
-                extractor._col_count = hints["col_count"]
-                extractor._reflected_col = hints["reflected_col"]
-                extractor._inject_prefix = hints.get("inject_prefix", "'")
-                extractor.db_type = hints["db_type"]
-        """
-        for inj in self.injections:
-            if injection_id and inj.get("id") != injection_id:
-                continue
-            if inj.get("injection_type") == "sqli" and inj.get("sqli"):
-                return inj["sqli"]
-        return None
+    def get_sqli_hints(self) -> dict[str, Any]:
+        return self.sqli_hints
 
     def summary(self) -> str:
+        hints = self.sqli_hints
         lines = [
-            f"Schema matched: {self.name}",
-            f"  Source: {self.source}",
-            f"  Stack: {', '.join(f'{k}={v}' for k, v in self.stack.items())}",
+            f"Pattern matched: {self.name}",
+            f"  Fingerprint: {self.matched_fingerprint}",
+            f"  Probe endpoints: {len(self.probe_endpoints)}",
         ]
-        for inj in self.injections:
-            hints = inj.get("sqli", {})
-            lines.append(
-                f"  Known injection: {inj.get('endpoint')} "
-                f"[{inj.get('method')}:{inj.get('body_type')}] "
-                f"field={inj.get('field')} "
-                f"col_count={hints.get('col_count')} "
-                f"reflected_col={hints.get('reflected_col')}"
-            )
+        if hints.get("try_positions_first"):
+            lines.append(f"  SQLi try positions first: {hints['try_positions_first']}")
+        if hints.get("likely_db"):
+            lines.append(f"  Likely DB: {hints['likely_db']}")
         return "\n".join(lines)
 
 
@@ -91,12 +60,12 @@ def _load_all_schemas() -> list[dict[str, Any]]:
     if not _SCHEMAS_DIR.exists():
         return schemas
     for path in sorted(_SCHEMAS_DIR.glob("*.yaml")):
-        if path.name == "example.yaml":
+        if path.name in ("README.md", "example.yaml"):
             continue
         try:
             with path.open("r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
-            if data and isinstance(data, dict):
+            if data and isinstance(data, dict) and data.get("fingerprints"):
                 data["_source_file"] = path.name
                 schemas.append(data)
         except Exception as exc:  # noqa: BLE001
@@ -104,21 +73,26 @@ def _load_all_schemas() -> list[dict[str, Any]]:
     return schemas
 
 
-def _fingerprint_matches(fingerprints: list[dict], response_body: str, response_headers: dict) -> bool:
-    """Return True only if ALL fingerprints in the list are satisfied."""
-    if not fingerprints:
-        return False
-    for fp in fingerprints:
-        if "response_contains" in fp:
-            if fp["response_contains"].lower() not in response_body.lower():
-                return False
-        if "header_contains" in fp:
-            needle = fp["header_contains"].lower()
-            if not any(needle in v.lower() for v in response_headers.values()):
-                return False
-        if "status_code" in fp:
-            pass  # status_code is checked at call site
+def _check_fingerprint(fp: dict, body: str, headers: dict) -> bool:
+    """Check one fingerprint — all fields within it must match (AND within one fp)."""
+    if "response_contains" in fp:
+        if fp["response_contains"].lower() not in body.lower():
+            return False
+    if "header_contains" in fp:
+        needle = fp["header_contains"].lower()
+        if not any(needle in str(v).lower() for v in headers.values()):
+            return False
     return True
+
+
+def _fingerprint_matches(fingerprints: list[dict], body: str, headers: dict) -> str | None:
+    """
+    OR logic — return the matched fingerprint description if ANY matches, else None.
+    """
+    for fp in fingerprints:
+        if _check_fingerprint(fp, body, headers):
+            return str(next(iter(fp.values())))
+    return None
 
 
 async def match_schema(
@@ -126,8 +100,8 @@ async def match_schema(
     http_client: httpx.AsyncClient,
 ) -> SchemaMatch | None:
     """
-    Fetch the target root URL and compare against all loaded schemas.
-    Returns the first matching SchemaMatch, or None if no match.
+    Fetch the target root URL and check against all loaded schemas.
+    Returns the first matching SchemaMatch, or None if no pattern matches.
     """
     schemas = _load_all_schemas()
     if not schemas:
@@ -144,23 +118,20 @@ async def match_schema(
 
     for schema_data in schemas:
         fingerprints = schema_data.get("fingerprints", [])
-        if not fingerprints:
-            continue
-        if _fingerprint_matches(fingerprints, body, headers):
+        matched = _fingerprint_matches(fingerprints, body, headers)
+        if matched:
             log.info(
-                f"schema: matched '{schema_data.get('name', schema_data['_source_file'])}' "
-                f"for target '{target_url}'"
+                f"schema: pattern '{schema_data.get('name')}' matched "
+                f"(fingerprint: '{matched}')"
             )
             return SchemaMatch(
-                name=schema_data.get("name", ""),
+                name=schema_data.get("name", "Unknown Pattern"),
                 description=schema_data.get("description", ""),
-                source=schema_data.get("source", ""),
-                stack=schema_data.get("stack", {}),
-                injections=schema_data.get("injections", []),
-                endpoints=schema_data.get("endpoints", []),
-                additional_findings=schema_data.get("additional_findings", []),
-                raw=schema_data,
+                probe_endpoints=schema_data.get("probe_endpoints", []),
+                sqli_hints=schema_data.get("sqli", {}),
+                extra_checks=schema_data.get("extra_checks", []),
+                matched_fingerprint=matched,
             )
 
-    log.debug(f"schema: no match for '{target_url}' across {len(schemas)} schema(s)")
+    log.debug(f"schema: no pattern match for '{target_url}' ({len(schemas)} schema(s) checked)")
     return None

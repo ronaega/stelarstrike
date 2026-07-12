@@ -95,7 +95,7 @@ def scan(
         raise typer.Exit(code=1)
 
     if orchestrator.matched_schema:
-        console.print(f"[bold green]Schema matched:[/] {orchestrator.matched_schema.name} — known parameters applied, discovery skipped")
+        console.print(f"[bold green]Pattern matched:[/] {orchestrator.matched_schema.name} — probe endpoints and sqli hints applied")
 
     _print_summary(report)
 

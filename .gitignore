@@ -19,6 +19,9 @@ config/config.yaml
 reports/*
 !reports/.gitkeep
 
+# PRD — internal planning document, not for public repo
+PRD.md
+
 # Editors / OS
 .vscode/
 .idea/
