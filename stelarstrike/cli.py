@@ -140,7 +140,7 @@ def schemas():
         except Exception:
             table.add_row(f.name, "[red]parse error[/]", "-", "-")
     console.print(table)
-    console.print(f"\n[dim]See schemas/README.md for format and how to create schemas from writeups.[/]")
+    console.print("\n[dim]See schemas/README.md for format and how to create schemas from writeups.[/]")
 
 
 @app.command()
