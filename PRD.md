@@ -225,8 +225,65 @@ Ordered roughly by expected value; not a committed timeline.
 - OQ1 — Should `payload_advisor` (currently unused) drive payload *generation* for the active-only checks in v1.1's new plugin classes, or stay scoped to suggesting variants of existing payloads? Leaning toward the latter for safety/predictability.
 - OQ2 — Should scope matching move from `fnmatch` globs to full URL-pattern matching (path + query awareness) once the discovery/crawler layer (v1.3) lands? Likely yes, since crawler-discovered URLs will have far more path variety than manually-entered ones.
 - OQ3 — Report redaction (`reporting.redact_secrets`) is currently a config flag with no implementation — needs a concrete redaction pass (e.g. regex-based secret scrubbing) before it's meaningfully "on."
+- OQ4 — Schema hints currently apply to the first matching `sqli` injection entry. Multi-injection schemas (e.g. login + search endpoint both injectable) should be able to apply hints per-URL — needs a URL-aware lookup in `_run_extraction`.
 
-## 10. Change Log
+---
+
+## 10. Alternative Schemas
+
+### What they are
+
+A schema is a YAML file in `schemas/` that encodes confirmed knowledge about a
+specific type of target — its stack, its injectable endpoints, the UNION column
+count, the reflected column position, and bypass payloads that are known to work.
+
+### How StelarStrike uses them
+
+1. At scan start, `core/schema_loader.py` fetches the target root URL and checks
+   it against each schema's `fingerprints` list.
+2. On a match, the orchestrator skips auto-discovery and column-count enumeration,
+   feeds the known `col_count` + `reflected_col` directly to `SQLiExtractor`, and
+   adds the schema's known endpoints to the scan queue.
+3. The CLI prints `Schema matched: <name>` so you know the fast path was used.
+
+### Benefits per scan
+
+| Without schema | With schema |
+|---|---|
+| Discovery crawl: 5–20 HTTP requests | Skipped — endpoints known |
+| UNION col-count enumeration: up to 15×N requests | Skipped — col_count known |
+| Position probe: up to col_count requests | Skipped — reflected_col known |
+| AI triage call on generic findings | Skippable for known-pattern targets |
+
+On a 10-column table with 5 injectable fields, a schema match saves ~75+ requests
+and the AI triage API call.
+
+### How to create a schema from a writeup
+
+1. Complete a scan (or obtain a writeup — your own, a classmate's, Big Pickle's output, etc.)
+2. Paste the writeup to Claude in your StelarStrike conversation.
+3. Ask: *"Extract this as a StelarStrike schema YAML for schemas/\<filename\>.yaml"*
+4. Claude produces the YAML — save it as `schemas/<target-name>.yaml`.
+5. Next scan against the same target type uses it automatically.
+
+### How to update schemas over time
+
+Each new writeup from a course lab, CTF, or bug bounty report is a potential schema.
+The pattern is always the same:
+> Paste writeup → Claude extracts schema → save file → faster future scans.
+
+### Schema file format contract
+
+Required: `name`, `fingerprints` (at least one), `injections`.
+Optional: `stack`, `endpoints`, `additional_findings`.
+Full format in `schemas/README.md`.
+
+`fingerprints` supports: `response_contains`, `header_contains`, `status_code`.
+All fingerprints in the list must match (AND logic).
+
+---
+
+## 11. Change Log
 
 - **2026-07-10 (2)** — `sqli` rewritten (v3): tests query params and every form field, POST as both form-encoded and JSON body; multi-DBMS error signatures + framework debug-page leaks; baseline false-positive filtering; dual-payload-verified boolean-blind with dynamic-content stripping; login-form auth-bypass detection; bounded UNION column-count confirmation (detection only, no data extraction). Added `stelarstrike scan --plugins id1,id2` (one-off plugin selection override) and `--verbose` (full request/payload debug logging) CLI flags.
 - **2026-07-10** — Auto-discovery pulled forward from the v1.3 roadmap into v1.0: `core/discovery.py` crawls same-origin links/forms one level deep and falls back to synthetic common parameter names, so `scan` no longer requires the user to manually supply a query parameter. Orchestrator now fans plugins out across every discovered (in-scope) URL. Added the CLI startup banner.
@@ -236,38 +293,48 @@ Ordered roughly by expected value; not a committed timeline.
 
 ## 🔖 Last Change
 
-> This section is overwritten every session to reflect the single most recent change. Use the Change Log (§10) for full history.
+> This section is overwritten every session. Use Change Log (§11) for full history.
 
-**Date:** 2026-07-11
+**Date:** 2026-07-12
 **Changed by:** Rona (via Claude)
 
-**What changed — SQLi extraction engine rebuilt (sentinel-based):**
+**What changed — Two-phase UNION extraction + Alternative Schemas system:**
 
-Root cause of extraction returning nothing: `_extract_value` had no way to distinguish the injected value from regular HTML content (nav links, CSS classes, etc.) — it just grabbed any long string it found, which was rarely the right one.
+**Root cause of extraction still not working:** `_union_scalar` always placed the sentinel in column position 0 (the integer `id` column in MerdekaBank's users table) → PostgreSQL type error → gave up. The reflected column is position 1 (`username`). This was confirmed by simulating the exact target response in a test.
 
-Fixes in `stelarstrike/plugins/sqli_extract.py`:
-- **Sentinel markers** (`STELR0...0RLETS`) — injected value is now wrapped with unique delimiters using DB-appropriate concat syntax (`||` for PostgreSQL/SQLite, `CONCAT()` for MySQL, `+` for MSSQL). `_extract_value` searches for `STELR0...0RLETS` first — if found, that's the value, regardless of surrounding HTML noise.
-- **`_compat_cols` now uses `NULL`** for all DBs — previously used `'1','2'` string literals which caused type mismatch errors in PostgreSQL's strict type system.
-- **`_union_scalar` tries three prefix contexts** — string (`'`), space/numeric (` `), and closing-paren (`')`), stopping at the first that gets the sentinel back. Column count mismatch responses now correctly break out to try the next count rather than the next prefix.
-- **Debug logging throughout** — every UNION probe attempt logs `col_count`, `prefix`, and whether the sentinel was found, so `--verbose` now shows exactly where extraction stalls.
-- `_extract_value` fallback chain: sentinel → JSON longest-string → very conservative regex (only returns if exactly one unambiguous match).
-- `tests/test_sqli_extract.py` fully rewritten — 13 tests, all sentinel-aware mocks.
+**Fixes in `stelarstrike/plugins/sqli_extract.py`:**
+- Added `_reflected_col: int | None` and `_inject_prefix: str` cache attributes.
+- Refactored `_union_scalar` into two phases: (1) `_find_col_count_and_position` tries NULL-only probes first (type-safe, confirms column count), then probes each position with the sentinel, detecting and skipping type errors per-position. (2) Once `_col_count` + `_reflected_col` are cached, subsequent calls use them directly (1 HTTP request vs 15+). Tries three injection prefix contexts: string (`'`), numeric (` `), and paren (`')`). Handles `MerdekaBank` case exactly: 10 columns, position 1, confirmed in mocked test.
+- `tests/test_sqli_extract.py` fully rewritten with two-phase-aware mocks (29 tests, all passing).
 
-**All 26 tests pass.**
+**New: Alternative Schemas system:**
+- `schemas/` directory — YAML schema files encoding confirmed target knowledge.
+- `schemas/README.md` — format spec, how to create schemas from writeups, how to update over time.
+- `schemas/merdekabank_flask_postgresql.yaml` — MerdekaBank schema extracted from Big Pickle writeup: col_count=10, reflected_col=1, bypass=`' OR 1=1-- -`, 10 tables, additional findings.
+- `schemas/lab2_43_157.yaml` — starter schema for second lab (43.157.213.172:1337), PENDING — fill in after first scan.
+- `stelarstrike/core/schema_loader.py` — fingerprints target on scan start, returns `SchemaMatch` with known parameters. Fingerprint types: `response_contains`, `header_contains`, `status_code`.
+- `stelarstrike/core/orchestrator.py` — calls `match_schema()` before discovery; on match, adds schema's known endpoints to scan queue instead of crawling; passes `schema_hints` (col_count, reflected_col, inject_prefix, db_type) to `PluginContext.options["schema_hints"]`.
+- `stelarstrike/plugins/sqli.py` — `_run_extraction` reads `options["schema_hints"]` and pre-sets extractor cache attributes, skipping all discovery probes.
+- `stelarstrike/cli.py` — `stelarstrike schemas` command lists available schema files; scan output line shows "Schema matched: <name>" on match.
+- PRD — new §10 Alternative Schemas documenting the system, format contract, and writeup-to-schema workflow. §11 Change Log, §9 Open Questions updated.
 
-**To run extraction against your lab:**
-```yaml
-# config/config.yaml
-engagement:
-  allow_active_payloads: true
-plugins:
-  sqli:
-    extraction:
-      enabled: true
-```
+**All 29 tests pass.**
+
+**For second lab — scan and then extract schema:**
 ```bash
+# Scan the second lab
+stelarstrike scan "http://43.157.213.172:1337/" --plugins sqli --verbose
+
+# Paste the output to Claude and ask:
+# "Extract this as a StelarStrike schema YAML for schemas/lab2_43_157.yaml"
+# Then replace schemas/lab2_43_157.yaml with Claude's output.
+```
+
+**For MerdekaBank with schema (fast path):**
+```bash
+# Schema match skips ~75+ HTTP requests and goes straight to known parameters
 stelarstrike scan "http://194.233.89.48:5000/" --plugins sqli --verbose
 ```
-`--verbose` now shows every UNION probe the extractor attempts so you can see exactly what it's doing.
+
 
 

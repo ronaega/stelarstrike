@@ -299,6 +299,24 @@ class SQLiPlugin(VulnerabilityPlugin):
                 db_type=db_type or "postgresql",
                 config=extraction_cfg,
             )
+
+            # Apply schema hints if available — skips column-count discovery
+            schema_hints = self.options.get("schema_hints")
+            if schema_hints:
+                if "col_count" in schema_hints:
+                    extractor._col_count = schema_hints["col_count"]
+                    log.info(f"sqli: schema hint applied — col_count={extractor._col_count}")
+                if "reflected_col" in schema_hints:
+                    extractor._reflected_col = schema_hints["reflected_col"]
+                    log.info(f"sqli: schema hint applied — reflected_col={extractor._reflected_col}")
+                if "inject_prefix" in schema_hints:
+                    extractor._inject_prefix = schema_hints["inject_prefix"]
+                if "db_type" in schema_hints and not db_type:
+                    extractor.db_type = schema_hints["db_type"]
+                    extractor.db = __import__(
+                        "stelarstrike.plugins.sqli_extract", fromlist=["_DB_BUILDERS"]
+                    )._DB_BUILDERS.get(extractor.db_type, extractor.db)
+
             result = await extractor.run()
         except Exception as exc:  # noqa: BLE001
             log.warning(f"sqli: extraction failed for '{field}': {exc}")

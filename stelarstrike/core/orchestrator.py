@@ -21,6 +21,7 @@ from stelarstrike.core.ai_client import AIClient
 from stelarstrike.core.config import PluginConfig, Settings
 from stelarstrike.core.discovery import discover_targets
 from stelarstrike.core.report import Finding, ReportBuilder
+from stelarstrike.core.schema_loader import match_schema
 from stelarstrike.core.target import Target, enforce_scope
 from stelarstrike.plugins import PLUGIN_REGISTRY
 from stelarstrike.plugins.base import PluginContext
@@ -33,6 +34,7 @@ class Orchestrator:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.ai_client = AIClient(settings.ai)
+        self.matched_schema = None  # set after schema check; readable by tests/CLI
 
     async def run(self, target_url: str, plugin_filter: set[str] | None = None) -> ReportBuilder:
         target = Target(url=target_url)
@@ -59,26 +61,47 @@ class Orchestrator:
         ) as http_client:
             semaphore = asyncio.Semaphore(self.settings.http.max_concurrency)
 
+            # Schema matching — check against known target patterns before discovery.
+            # A match skips column-count enumeration and goes straight to known parameters.
+            self.matched_schema = await match_schema(target_url, http_client)
+            if self.matched_schema:
+                log.info(self.matched_schema.summary())
+
             target_urls = [target_url]
             if self.settings.discovery.enabled:
-                target_urls = await discover_targets(
-                    base_url=target_url,
-                    http_client=http_client,
-                    scope=self.settings.engagement.scope,
-                    out_of_scope=self.settings.engagement.out_of_scope,
-                    max_urls=self.settings.discovery.max_urls,
-                    max_depth=self.settings.discovery.max_depth,
-                    synthetic_params=self.settings.discovery.synthetic_params,
-                )
-                log.info(f"Discovery: scanning {len(target_urls)} URL(s): {target_urls}")
+                # If schema provides known endpoints, also scan those directly.
+                if self.matched_schema:
+                    base_host = target_url.rstrip("/")
+                    for ep in self.matched_schema.endpoints:
+                        if not ep.get("auth_required", False) and ep.get("method") in ("GET", "POST"):
+                            ep_url = base_host + ep["path"]
+                            if ep_url not in target_urls:
+                                target_urls.append(ep_url)
+                    log.info(f"Schema: added {len(target_urls) - 1} known endpoint(s) to scan queue")
+                else:
+                    target_urls = await discover_targets(
+                        base_url=target_url,
+                        http_client=http_client,
+                        scope=self.settings.engagement.scope,
+                        out_of_scope=self.settings.engagement.out_of_scope,
+                        max_urls=self.settings.discovery.max_urls,
+                        max_depth=self.settings.discovery.max_depth,
+                        synthetic_params=self.settings.discovery.synthetic_params,
+                    )
+                    log.info(f"Discovery: scanning {len(target_urls)} URL(s): {target_urls}")
+
+            # Build schema hints for plugins that support them (e.g. sqli)
+            schema_hints: dict[str, Any] = {}
+            if self.matched_schema:
+                sqli_hints = self.matched_schema.get_sqli_hints()
+                if sqli_hints:
+                    schema_hints["sqli_hints"] = sqli_hints
 
             tasks = []
             for url in target_urls:
                 url_target = Target(url=url)
                 for plugin_id, plugin_cls in PLUGIN_REGISTRY.items():
                     if plugin_filter is not None:
-                        # CLI --plugins was given: it's the sole selector for this run,
-                        # regardless of each plugin's `enabled` flag in config.yaml.
                         if plugin_id not in plugin_filter:
                             continue
                         plugin_cfg = self.settings.plugins.get(plugin_id) or PluginConfig()
@@ -87,10 +110,15 @@ class Orchestrator:
                         if plugin_cfg is None or not plugin_cfg.enabled:
                             continue
 
+                    # Merge schema hints into plugin options (schema wins for known parameters)
+                    merged_options = {**plugin_cfg.options}
+                    if plugin_id == "sqli" and "sqli_hints" in schema_hints:
+                        merged_options["schema_hints"] = schema_hints["sqli_hints"]
+
                     ctx = PluginContext(
                         target=url_target,
                         http_client=http_client,
-                        options=plugin_cfg.options,
+                        options=merged_options,
                         allow_active_payloads=self.settings.engagement.allow_active_payloads,
                         semaphore=semaphore,
                     )

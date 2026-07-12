@@ -94,6 +94,9 @@ def scan(
         console.print(f"[bold red]Scope error:[/] {exc}")
         raise typer.Exit(code=1)
 
+    if orchestrator.matched_schema:
+        console.print(f"[bold green]Schema matched:[/] {orchestrator.matched_schema.name} — known parameters applied, discovery skipped")
+
     _print_summary(report)
 
     written = []
@@ -104,6 +107,40 @@ def scan(
 
     for path in written:
         console.print(f"[green]Report written:[/] {path}")
+
+
+@app.command()
+def schemas():
+    """List all available alternative schema files in the schemas/ directory."""
+    from pathlib import Path
+    import yaml as _yaml
+    schemas_dir = Path("schemas")
+    if not schemas_dir.exists():
+        console.print("[yellow]No schemas/ directory found.[/] Create it and add .yaml schema files.")
+        return
+    files = sorted(schemas_dir.glob("*.yaml"))
+    if not files:
+        console.print("[yellow]No schema files found in schemas/[/]")
+        return
+    table = Table(title="Alternative Schemas")
+    table.add_column("File")
+    table.add_column("Name")
+    table.add_column("Fingerprints")
+    table.add_column("Injections")
+    for f in files:
+        if f.name == "example.yaml":
+            continue
+        try:
+            data = _yaml.safe_load(f.read_text())
+            fps = ", ".join(
+                next(iter(fp.values())) for fp in data.get("fingerprints", [])[:2]
+            )
+            injs = str(len(data.get("injections", [])))
+            table.add_row(f.name, data.get("name", "?"), fps or "-", injs)
+        except Exception:
+            table.add_row(f.name, "[red]parse error[/]", "-", "-")
+    console.print(table)
+    console.print(f"\n[dim]See schemas/README.md for format and how to create schemas from writeups.[/]")
 
 
 @app.command()
