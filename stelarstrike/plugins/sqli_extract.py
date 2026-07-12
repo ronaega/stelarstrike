@@ -30,7 +30,6 @@ Opt-in: only runs when `extraction.enabled: true` AND
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
@@ -388,7 +387,7 @@ class SQLiExtractor:
                         sentinel_resp = await self.inject(sentinel_payload)
                         value = self._extract_value(sentinel_resp)
                         if value:
-                            log.info(f"sqli-extract: ✓ sentinel extraction confirmed")
+                            log.info("sqli-extract: ✓ sentinel extraction confirmed")
                             return True
                         # Literal worked but sentinel extraction didn't — try alternate concat
                         log.debug("sqli-extract: literal ok but sentinel extraction empty — trying alt")
@@ -397,7 +396,7 @@ class SQLiExtractor:
                             alt_resp = await self.inject(alt_payload)
                             value = self._extract_value(alt_resp)
                             if value:
-                                log.info(f"sqli-extract: ✓ alt sentinel expression worked")
+                                log.info("sqli-extract: ✓ alt sentinel expression worked")
                                 return True
                     except Exception as exc:
                         log.debug(f"sqli-extract: phase 3 sentinel probe failed: {exc}")
