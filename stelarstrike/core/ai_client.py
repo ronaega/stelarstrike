@@ -1,9 +1,9 @@
 """
-Thin AI wrapper around LiteLLM.
+Thin AI wrapper around OPENCODE (Big Pickle).
 
-Why LiteLLM: it gives StelarStrike one interface for OpenAI, Anthropic,
-Azure OpenAI, and local models (Ollama), so switching providers is a
-one-line change in config.yaml / .env instead of a code change.
+Why OPENCODE: it gives StelarStrike one interface for high-quality
+reasoning models, so switching providers is a one-line change in
+config.yaml / .env instead of a code change.
 
 The AI layer is used for three optional roles, each toggle-able in
 config.yaml under `ai.roles`:
@@ -30,21 +30,21 @@ log = get_logger(__name__)
 class AIClient:
     def __init__(self, config: AIConfig):
         self.config = config
-        self._litellm = None
+        self._opencode = None
         if self.config.enabled:
             try:
-                import litellm  # imported lazily so the tool works without it installed
+                import opencode  # imported lazily so the tool works without it installed
 
-                self._litellm = litellm
+                self._opencode = opencode
             except ImportError:
-                log.warning("litellm not installed; AI features disabled. `pip install litellm`.")
+                log.warning("opencode not installed; AI features disabled. `pip install opencode`.")
                 self.config.enabled = False
 
     def _complete(self, system: str, user: str) -> str | None:
-        if not self.config.enabled or self._litellm is None:
+        if not self.config.enabled or self._opencode is None:
             return None
         try:
-            response = self._litellm.completion(
+            response = self._opencode.complete(
                 model=self.config.provider,
                 max_tokens=self.config.max_tokens,
                 temperature=self.config.temperature,

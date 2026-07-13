@@ -76,6 +76,17 @@ class ReportBuilder:
                 "",
                 f"**Evidence:**\n```\n{f.evidence or 'n/a'}\n```",
                 "",
+            ]
+
+            # Add extracted data section if present
+            if f.extracted_data:
+                lines.append("**Extracted Data:**")
+                lines.append("```json")
+                lines.append(json.dumps(f.extracted_data, indent=2))
+                lines.append("```")
+                lines.append("")
+
+            lines += [
                 f"**Remediation:** {f.remediation}",
                 "",
                 "---",

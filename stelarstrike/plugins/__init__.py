@@ -16,6 +16,7 @@ from stelarstrike.plugins.idor import IDORPlugin
 from stelarstrike.plugins.jwt_vuln import JWTPlugin
 from stelarstrike.plugins.nosqli import NoSQLiPlugin
 from stelarstrike.plugins.sqli import SQLiPlugin
+
 from stelarstrike.plugins.ssrf import SSRFPlugin
 from stelarstrike.plugins.xss import XSSPlugin
 

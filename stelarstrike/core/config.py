@@ -52,7 +52,7 @@ class PluginConfig(BaseModel):
 
 class AIConfig(BaseModel):
     enabled: bool = True
-    provider: str = "anthropic/claude-sonnet-4-6"
+    provider: str = "opencode/big-pickle"
     max_tokens: int = 2000
     temperature: float = 0.2
     roles: dict[str, bool] = Field(default_factory=dict)

@@ -19,7 +19,7 @@ dependencies = [
     "tldextract>=5.1.1",
     "beautifulsoup4>=4.12.3",
     "PyJWT>=2.8.0",
-    "litellm>=1.35.0",
+    "opencode>=0.1.0",
 ]
 
 [project.optional-dependencies]
