@@ -146,7 +146,7 @@ class SQLiPlugin(VulnerabilityPlugin):
         base_value = params.get(param, "1")
 
         # Get baseline response
-        baseline_url = build_url_with_params(self.target_url, params)
+        baseline_url = build_url_with_params(self.target_url, {**params, param: base_value})
         try:
             baseline = await self.get(baseline_url)
             baseline_body = baseline.text
