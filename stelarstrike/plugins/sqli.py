@@ -311,7 +311,7 @@ class SQLiPlugin(VulnerabilityPlugin):
             # Test with time payload
             start = time.monotonic()
             try:
-                resp = await self.get(url)
+                await self.get(url)
             except Exception:
                 continue
             elapsed = time.monotonic() - start
