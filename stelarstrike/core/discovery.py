@@ -82,13 +82,13 @@ async def discover_targets(
             break
         try:
             page_resp = await http_client.get(link)
+            for form in extract_forms(page_resp.text):
+                if form["method"] == "get" and form["inputs"]:
+                    params = {i["name"]: i.get("value") or "1" for i in form["inputs"]}
+                    action = urljoin(link, form["action"]) if form["action"] else link
+                    candidates.add(build_url_with_params(action, params))
         except Exception:
             continue
-        for form in extract_forms(page_resp.text):
-            if form["method"] == "get" and form["inputs"]:
-                params = {i["name"]: i.get("value") or "1" for i in form["inputs"]}
-                action = urljoin(link, form["action"]) if form["action"] else link
-                candidates.add(build_url_with_params(action, params))
 
     if len(candidates) == 1 and not get_query_params(base_url):
         log.info("Discovery: no parametrized URLs found; guessing common parameter names.")
