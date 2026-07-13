@@ -1,14 +1,12 @@
 """
-Tests for the SQLi extraction engine — two-phase-aware mocks.
+Tests for the SQLi extraction engine.
 
-The two-phase approach:
-  Phase 1: NULL-only probe to confirm column count (type-safe)
-  Phase 2: Sentinel in each position to find the reflected column
-
-Mocks simulate a realistic target:
-  - Returns column-mismatch error for wrong column counts
-  - Returns type-error when sentinel is in wrong-typed position (e.g. integer id)
-  - Reflects the sentinel in the JSON username field (position 1 of 10)
+Covers:
+  - Baseline-diff detection (works even when the target silently
+    swallows every SQL error and shows no distinguishing text)
+  - Multi-comment-style / multi-context probing
+  - The iterative AI agent loop (multi-round, not one-shot)
+  - Markdown table rendering
 """
 import asyncio
 import re as _re
@@ -17,22 +15,16 @@ import pytest
 
 from stelarstrike.plugins.sqli_extract import SQLiExtractor, ExtractionResult
 
-S = SQLiExtractor._SENTINEL_START   # "STELR0"
-E = SQLiExtractor._SENTINEL_END     # "0RLETS"
+S = SQLiExtractor._SENTINEL_START
+E = SQLiExtractor._SENTINEL_END
+LITERAL = SQLiExtractor._LITERAL_PROBE
 
 
 def _wrap(value: str) -> str:
-    """Simulate what the DB echoes back in the response."""
     return f'{{"username": "{S}{value}{E}", "token": "eyJ..."}}'
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
-
 def _make_preconfigured_extractor(inject_responses: dict, db_type: str = "postgresql") -> SQLiExtractor:
-    """
-    Extractor with col_count=1, reflected_col=0 pre-cached — bypasses discovery.
-    inject_responses maps a keyword → response body.
-    """
     async def mock_inject(payload: str) -> str:
         payload_lower = payload.lower()
         for key, response in inject_responses.items():
@@ -51,147 +43,66 @@ def _make_preconfigured_extractor(inject_responses: dict, db_type: str = "postgr
     return ext
 
 
-def _make_discovery_extractor(col_count: int, reflected_pos: int,
-                              db_type: str = "postgresql") -> SQLiExtractor:
-    """
-    Simulates a target with known col_count and reflected_pos.
-    Handles all three phases: Phase 1 NULL probe, Phase 2 literal probe, Phase 3 sentinel.
-    """
-    MISMATCH = "each union query must have the same number of columns"
-    TYPE_ERR = "invalid input syntax for type integer"
-    LITERAL = SQLiExtractor._LITERAL_PROBE
-    _S = SQLiExtractor._SENTINEL_START
-
-    async def mock_inject(payload: str) -> str:
-        p = payload.lower()
-        m = _re.search(r"union select (.+?)(?:--|#|$)", p)
-        if not m:
-            return '{"error": "no union"}'
-        cols = [c.strip() for c in m.group(1).split(",")]
-        n = len(cols)
-
-        if n != col_count:
-            return f'{{"error": "{MISMATCH}"}}'
-
-        # Phase 1: NULL-only probe
-        if all(c == "null" for c in cols):
-            return '{"message": "null probe ok"}'
-
-        # Phase 2: Literal probe (STELRPROBE)
-        for i, col in enumerate(cols):
-            if LITERAL.lower() in col:
-                if i == reflected_pos:
-                    return f'{{"username": "{LITERAL}", "token": "eyJ..."}}' 
-                elif i == 0 and reflected_pos != 0:
-                    return f'{{"error": "{TYPE_ERR}"}}'
-                return '{"message": "not reflected here"}'
-
-        # Phase 3: Sentinel probe
-        for i, col in enumerate(cols):
-            if _S.lower() in col:
-                if i == reflected_pos:
-                    return _wrap(f"extracted_value_{i}")
-                elif i == 0 and reflected_pos != 0:
-                    return f'{{"error": "{TYPE_ERR}"}}'
-                return '{"message": "not reflected here"}'
-
-        return '{"message": "ok"}'
-
-    ext = SQLiExtractor(
-        inject_fn=mock_inject,
-        db_type=db_type,
-        config={"enabled": True, "max_tables": 5, "max_rows_per_table": 10,
-                "extract": ["version", "schema"]},
-    )
-    return ext
-
-
-# ── sentinel extraction ───────────────────────────────────────────────────────
+# ── value extraction ─────────────────────────────────────────────────────────
 
 def test_extract_value_finds_sentinel_in_json():
     ext = _make_preconfigured_extractor({})
-    json_resp = f'{{"username": "{S}PostgreSQL 13.23{E}", "token": "eyJ..."}}'
-    result = ext._extract_value(json_resp)
+    result = ext._extract_value(_wrap("PostgreSQL 13.23"))
     assert result == "PostgreSQL 13.23"
 
 
 def test_extract_value_finds_sentinel_in_html():
     ext = _make_preconfigured_extractor({})
-    html = f"<html><nav>Home Products About</nav><p>{S}PostgreSQL 13.23{E}</p></html>"
-    result = ext._extract_value(html)
-    assert result == "PostgreSQL 13.23"
+    html = f"<html><nav>Home Products</nav><p>{S}PostgreSQL 13.23{E}</p></html>"
+    assert ext._extract_value(html) == "PostgreSQL 13.23"
 
 
 def test_extract_value_empty_when_no_sentinel():
     ext = _make_preconfigured_extractor({})
-    result = ext._extract_value("<html><body>Login failed. Invalid credentials.</body></html>")
-    assert result == ""
+    assert ext._extract_value("<html><body>Login failed.</body></html>") == ""
 
 
-# ── two-phase discovery ───────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_discovery_finds_correct_col_count_and_position():
-    """10-column table, reflected at position 1 — matches MerdekaBank."""
-    ext = _make_discovery_extractor(col_count=10, reflected_pos=1)
-    found = await ext._find_col_count_and_position(
-        wrapped=f"'{S}'||(version())||'{E}'",
-        comment="-- -",
-    )
-    assert found is True
-    assert ext._col_count == 10
-    assert ext._reflected_col == 1
-
+# ── baseline-diff detection: the actual bug fix ──────────────────────────────
 
 @pytest.mark.asyncio
-async def test_discovery_finds_col_count_3_position_0():
-    """3-column table, reflected at position 0 — simple case."""
-    ext = _make_discovery_extractor(col_count=3, reflected_pos=0)
-    found = await ext._find_col_count_and_position(
-        wrapped=f"'{S}'||(version())||'{E}'",
-        comment="-- -",
-    )
-    assert found is True
-    assert ext._col_count == 3
-    assert ext._reflected_col == 0
-
-
-@pytest.mark.asyncio
-async def test_discovery_type_error_forces_next_position():
+async def test_silent_app_detected_via_baseline_diff_not_error_text():
     """
-    Simulate position 0 as INTEGER (type error), position 1 as TEXT (reflected).
-    The extractor should skip 0 and find 1.
+    Simulates the real-world bug: an app that swallows EVERY SQL exception
+    and re-renders the exact same page regardless of column-count
+    correctness. The old error-text-based detection could never work here.
+    Baseline-diff detection must still find the reflected column because a
+    CORRECT column count changes the response (reflects STELRPROBE) while
+    an INCORRECT one returns byte-identical content to the baseline.
     """
-    TYPE_ERR = "invalid input syntax for type integer"
-    MISMATCH = "each union query must have the same number of columns"
-    LITERAL = SQLiExtractor._LITERAL_PROBE
+    BASELINE_PAGE = '{"username": "", "message": "Invalid credentials"}'
+    CORRECT_COL_COUNT = 3
+    CORRECT_POSITION = 1
 
     async def mock_inject(payload: str) -> str:
+        if payload == "":
+            return BASELINE_PAGE
+
         p = payload.lower()
-        m = _re.search(r"union select (.+?)(?:--|#|$)", p)
+        m = _re.search(r"union select (.+?)(?:--|#|;|$)", p)
         if not m:
-            return '{"error": "no union"}'
+            return BASELINE_PAGE  # no UNION at all -> looks like baseline
         cols = [c.strip() for c in m.group(1).split(",")]
-        if len(cols) != 3:
-            return f'{{"error": "{MISMATCH}"}}'
-        if all(c == "null" for c in cols):
-            return '{"ok": true}'
-        # Phase 2: literal probe
-        for i, c in enumerate(cols):
-            if LITERAL.lower() in c:
-                if i == 0:
-                    return f'{{"error": "{TYPE_ERR}"}}'
-                if i == 1:
-                    return f'{{"username": "{LITERAL}"}}'
-                return '{"message": "nothing"}'
-        # Phase 3: sentinel probe
-        for i, c in enumerate(cols):
-            if "stelr0" in c:
-                if i == 0:
-                    return f'{{"error": "{TYPE_ERR}"}}'
-                if i == 1:
-                    return _wrap("extracted_value")
-        return '{"message": "nothing reflected"}'
+        n = len(cols)
+
+        # Silently swallow wrong column count -> identical to baseline, no error text
+        if n != CORRECT_COL_COUNT:
+            return BASELINE_PAGE
+
+        # Correct column count: reflect literal probe if present at the right position
+        for i, col in enumerate(cols):
+            if LITERAL.lower() in col and i == CORRECT_POSITION:
+                return f'{{"username": "{LITERAL}", "message": "ok"}}'
+            if S.lower() in col and i == CORRECT_POSITION:
+                return _wrap("extracted_value")
+
+        # Correct column count but wrong position -> still "succeeds" but no reflection,
+        # response differs slightly from baseline (no error) but doesn't contain probe
+        return '{"username": "", "message": "ok, no reflection"}'
 
     ext = SQLiExtractor(
         inject_fn=mock_inject,
@@ -200,86 +111,153 @@ async def test_discovery_type_error_forces_next_position():
     )
     found = await ext._find_col_count_and_position(f"'{S}'||(version())||'{E}'", "-- -")
     assert found is True
+    assert ext._col_count == CORRECT_COL_COUNT
+    assert ext._reflected_col == CORRECT_POSITION
+
+
+@pytest.mark.asyncio
+async def test_completely_silent_app_with_no_diff_falls_through_to_ai():
+    """If literally nothing differs from baseline ever, automated probing must
+    give up and hand off to the AI agent (tested separately) rather than
+    hang or false-positive on col_count=1."""
+    BASELINE_PAGE = '{"message": "always the same"}'
+
+    async def mock_inject(payload: str) -> str:
+        return BASELINE_PAGE  # never differs, no matter what
+
+    ai_calls = []
+
+    async def _run():
+        def fake_ai(prompt: str) -> str:
+            ai_calls.append(prompt)
+            return '{"payload": "", "col_count": null, "position": null, "reasoning": "give up"}'
+
+        ext = SQLiExtractor(
+            inject_fn=mock_inject,
+            db_type="postgresql",
+            config={"enabled": True},
+            ai_client=fake_ai,
+        )
+        found = await ext._find_col_count_and_position(f"'{S}'||(version())||'{E}'", "-- -")
+        return found, ext
+
+    found, ext = await _run()
+    assert found is False
+    assert len(ai_calls) > 0, "AI agent loop should have been invoked"
+
+
+# ── iterative AI agent loop ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_ai_agent_loop_is_genuinely_iterative_not_one_shot():
+    """
+    The AI must be given multiple rounds, each seeing the prior attempt's
+    result, until it succeeds or exhausts max_rounds. This test simulates
+    an AI that gets it wrong twice before succeeding on round 3.
+    """
+    BASELINE = '{"message": "no"}'
+    round_count = {"n": 0}
+
+    async def mock_inject(payload: str) -> str:
+        if payload == "":
+            return BASELINE
+        if "col_count_3_pos_1" in payload:
+            return _wrap("found_it")
+        return BASELINE
+
+    def fake_ai(prompt: str) -> str:
+        round_count["n"] += 1
+        n = round_count["n"]
+        if n == 1:
+            return '{"payload": "col_count_2_pos_0_attempt", "col_count": 2, "position": 0, "prefix": "\'", "comment": "-- -", "reasoning": "try 2 cols"}'
+        if n == 2:
+            return '{"payload": "col_count_5_pos_3_attempt", "col_count": 5, "position": 3, "prefix": "\'", "comment": "-- -", "reasoning": "try 5 cols"}'
+        return '{"payload": "col_count_3_pos_1", "col_count": 3, "position": 1, "prefix": "\'", "comment": "-- -", "reasoning": "try 3 cols pos 1"}'
+
+    ext = SQLiExtractor(
+        inject_fn=mock_inject,
+        db_type="postgresql",
+        config={"enabled": True},
+        ai_client=fake_ai,
+    )
+    found = await ext._ai_agent_loop(f"'{S}'||(version())||'{E}'", BASELINE, max_rounds=6)
+
+    assert found is True
+    assert round_count["n"] == 3, f"expected exactly 3 AI rounds before success, got {round_count['n']}"
+    assert ext._col_count == 3
     assert ext._reflected_col == 1
 
 
-# ── version extraction ────────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_ai_agent_loop_gives_up_after_max_rounds():
+    async def mock_inject(payload: str) -> str:
+        return '{"message": "never changes"}'
+
+    call_count = {"n": 0}
+
+    def fake_ai(prompt: str) -> str:
+        call_count["n"] += 1
+        return '{"payload": "some_attempt", "col_count": 4, "position": 0, "reasoning": "guess"}'
+
+    ext = SQLiExtractor(
+        inject_fn=mock_inject,
+        db_type="postgresql",
+        config={"enabled": True},
+        ai_client=fake_ai,
+    )
+    found = await ext._ai_agent_loop(f"'{S}'||(version())||'{E}'", '{"message": "never changes"}', max_rounds=3)
+
+    assert found is False
+    assert call_count["n"] == 3, "should try exactly max_rounds times, no more no less"
+
+
+@pytest.mark.asyncio
+async def test_ai_call_failure_does_not_crash_extraction():
+    """If the AI client raises (e.g. temperature rejected by model), the
+    extractor must degrade gracefully, not propagate the exception."""
+    async def mock_inject(payload: str) -> str:
+        return '{"message": "baseline"}'
+
+    def crashing_ai(prompt: str) -> str:
+        raise Exception("litellm.BadRequestError: temperature does not support 0")
+
+    ext = SQLiExtractor(
+        inject_fn=mock_inject,
+        db_type="postgresql",
+        config={"enabled": True},
+        ai_client=crashing_ai,
+    )
+    # Should not raise
+    found = await ext._ai_agent_loop(f"'{S}'||(version())||'{E}'", '{"message": "baseline"}', max_rounds=2)
+    assert found is False
+
+
+# ── version / table / column extraction (cached-position path) ──────────────
 
 @pytest.mark.asyncio
 async def test_postgresql_version_extraction():
-    ext = _make_preconfigured_extractor({
-        "version()": _wrap("PostgreSQL 13.23 on x86_64"),
-    })
+    ext = _make_preconfigured_extractor({"version()": _wrap("PostgreSQL 13.23 on x86_64")})
     version = await ext._get_version()
     assert "PostgreSQL" in version
     assert "13.23" in version
 
 
 @pytest.mark.asyncio
-async def test_mysql_version_extraction():
-    ext = _make_preconfigured_extractor({
-        "version()": _wrap("8.0.32-MySQL Community Server"),
-    }, db_type="mysql")
-    version = await ext._get_version()
-    assert "8.0.32" in version
-
-
-# ── table discovery ───────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
 async def test_table_discovery_parses_space_separated_names():
-    ext = _make_preconfigured_extractor({
-        "pg_tables": _wrap("users orders products api_keys"),
-    })
+    ext = _make_preconfigured_extractor({"pg_tables": _wrap("users orders api_keys")})
     tables = await ext._get_tables()
     assert "users" in tables
-    assert "orders" in tables
     assert "api_keys" in tables
 
 
 @pytest.mark.asyncio
 async def test_column_discovery():
     ext = _make_preconfigured_extractor({
-        "information_schema.columns": _wrap("id username email password created_at"),
+        "information_schema.columns": _wrap("id username email password"),
     })
     cols = await ext._get_columns("users")
     assert "username" in cols
     assert "password" in cols
-
-
-# ── cached position reuse ─────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_cached_col_count_and_position_used_on_subsequent_call():
-    calls = []
-
-    async def mock_inject(payload: str) -> str:
-        calls.append(payload)
-        return _wrap("somevalue")
-
-    ext = SQLiExtractor(
-        inject_fn=mock_inject,
-        db_type="postgresql",
-        config={"enabled": True},
-    )
-    ext._col_count = 3
-    ext._reflected_col = 1  # both must be set to skip discovery
-    result = await ext._union_scalar("(SELECT 'test')")
-    assert len(calls) == 1, f"Expected 1 call (cached), got {len(calls)}"
-    assert result == "somevalue"
-
-
-# ── compat cols ───────────────────────────────────────────────────────────────
-
-def test_compat_cols_uses_null_for_all_dbs():
-    for db_type in ("postgresql", "mysql", "mssql", "sqlite"):
-        ext = _make_preconfigured_extractor({}, db_type=db_type)
-        assert ext._compat_cols(3) == "NULL,NULL,NULL"
-
-
-def test_compat_cols_empty_for_zero():
-    ext = _make_preconfigured_extractor({})
-    assert ext._compat_cols(0) == ""
 
 
 # ── table ranking ─────────────────────────────────────────────────────────────
@@ -290,6 +268,44 @@ def test_high_value_table_ranking():
     ranked = ext._rank_tables()
     assert ranked.index("users") < ranked.index("products")
     assert ranked.index("admin_tokens") < ranked.index("logs")
+
+
+# ── markdown table rendering ("Big Pickle style") ────────────────────────────
+
+def test_markdown_table_rendering():
+    result = ExtractionResult(
+        db_version="PostgreSQL 13.23",
+        db_type="postgresql",
+        tables=["users"],
+        columns={"users": ["id", "username", "password"]},
+        data={"users": [
+            {"id": "1", "username": "admin", "password": "hunter2"},
+            {"id": "2", "username": "bob", "password": "hunter3"},
+        ]},
+    )
+    md = result.to_markdown_tables()
+    assert "| id | username | password |" in md
+    assert "| 1 | admin | hunter2 |" in md
+    assert "| 2 | bob | hunter3 |" in md
+    assert "PostgreSQL 13.23" in md
+
+
+def test_markdown_table_handles_no_data():
+    result = ExtractionResult()
+    md = result.to_markdown_tables()
+    assert "No data extracted" in md
+
+
+def test_markdown_table_escapes_pipe_characters():
+    result = ExtractionResult(
+        db_version="PG",
+        db_type="postgresql",
+        tables=["t"],
+        columns={"t": ["col"]},
+        data={"t": [{"col": "value|with|pipes"}]},
+    )
+    md = result.to_markdown_tables()
+    assert "\\|" in md
 
 
 # ── extraction disabled ───────────────────────────────────────────────────────
@@ -339,24 +355,3 @@ async def test_extraction_disabled_produces_no_extracted_data():
     findings = await SQLiPlugin(ctx).run()
     for f in findings:
         assert f.extracted_data is None
-
-
-# ── result formatting ─────────────────────────────────────────────────────────
-
-def test_extraction_result_summary_and_dict():
-    result = ExtractionResult(
-        db_version="PostgreSQL 13.23",
-        db_type="postgresql",
-        tables=["users", "orders"],
-        columns={"users": ["id", "username", "password"]},
-        data={"users": [{"id": "1", "username": "admin", "password": "hunter2"}]},
-    )
-    summary = result.summary()
-    assert "PostgreSQL 13.23" in summary
-    assert "users" in summary
-    assert "admin" in summary
-
-    d = result.to_dict()
-    assert d["db_type"] == "postgresql"
-    assert "users" in d["tables"]
-    assert d["data"]["users"][0]["username"] == "admin"

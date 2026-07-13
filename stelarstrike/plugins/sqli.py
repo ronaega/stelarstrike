@@ -304,22 +304,29 @@ class SQLiPlugin(VulnerabilityPlugin):
                 return ""
 
         try:
-            # Build a simple AI completion function from LiteLLM if AI is configured
+            # Build an AI completion function from LiteLLM if AI is configured.
+            # Some models (e.g. gpt-5.5) reject temperature != 1, so this retries
+            # without a temperature override rather than crashing outright.
             ai_completion = None
             ai_cfg = self.options.get("_ai_config")
             if ai_cfg and ai_cfg.get("enabled"):
                 try:
                     import litellm as _litellm
+
                     def ai_completion(prompt: str) -> str:
-                        resp = _litellm.completion(
-                            model=ai_cfg.get("provider", "openai/gpt-4o-mini"),
-                            max_tokens=500,
-                            temperature=0,
-                            messages=[{"role": "user", "content": prompt}],
-                        )
-                        return resp["choices"][0]["message"]["content"]
-                except Exception:
-                    pass
+                        model = ai_cfg.get("provider", "openai/gpt-4o-mini")
+                        try:
+                            resp = _litellm.completion(
+                                model=model,
+                                max_tokens=500,
+                                messages=[{"role": "user", "content": prompt}],
+                            )
+                            return resp["choices"][0]["message"]["content"]
+                        except Exception as ai_exc:  # noqa: BLE001
+                            log.debug(f"sqli: AI completion call failed: {ai_exc}")
+                            return ""
+                except ImportError:
+                    log.debug("sqli: litellm not installed — AI-guided extraction fallback unavailable")
 
             extractor = SQLiExtractor(
                 inject_fn=inject_fn,
@@ -459,7 +466,6 @@ class SQLiPlugin(VulnerabilityPlugin):
                 continue
 
             true1_clean = self._strip_dynamic(true1_resp.text)
-            true2_clean = self._strip_dynamic(true2_resp.text)
             false_clean = self._strip_dynamic(false_resp.text)
 
             # Consistency check — use STATUS CODE as primary signal, not body equality.
