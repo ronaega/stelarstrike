@@ -296,4 +296,4 @@ StelarStrike can suggest external tools for deeper testing:
 
 ## Disclaimer
 
-StelarStrike is provided for **authorized security testing and educational purposes only**. Only run it against systems you own or have explicit, documented permission to test. The authors are not responsible for misuse or damage caused by this tool.
+StelarStrike is provided for **authorized security testing and educational purposes only**. Only run it against systems you own or have explicit, documented permission to test. The authors are not responsible for misuse or damage caused by this tool. Suwun!
