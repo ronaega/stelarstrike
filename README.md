@@ -6,77 +6,75 @@
 
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" /></a>
+  <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker" /></a>
+  <a href="https://github.com/features/actions"><img src="https://img.shields.io/badge/GitHub%20Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white" alt="GitHub Actions" /></a>
+  <a href="https://opencode.ai/"><img src="https://img.shields.io/badge/OpenCode-000000?style=for-the-badge&logo=openai&logoColor=white" alt="OpenCode" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="MIT License" /></a>
 </p>
 
 **StelarStrike** is a modular, AI-assisted web vulnerability orchestration framework for **authorized** penetration testing and security research. It coordinates a set of plugin-based vulnerability checks against a target, optionally uses an LLM to triage findings and draft a report narrative, and outputs a clean Markdown/JSON report.
 
-> **Authorized use only.** StelarStrike is built for testing systems you own or have explicit written permission to test. It enforces a scope allowlist and fails closed by default.
+> ⚠️ **Authorized use only.** StelarStrike is built for testing systems you own or have explicit written permission to test (bug bounty programs, CTFs, your own lab, or a client engagement with a signed scope). It enforces a scope allowlist and fails closed by default — see [Scope Enforcement](#scope-enforcement).
 
 ---
 
 ## Table of Contents
 
 - [Why StelarStrike](#why-stelarstrike)
-- [Methodology](#methodology)
+- [v1.0 Scope](#v10-scope)
 - [Architecture](#architecture)
 - [Installation](#installation)
+- [Uninstalling](#uninstalling)
+- [Updating](#updating)
 - [Configuration](#configuration)
+  - [1. Environment variables (`.env`)](#1-environment-variables-env)
+  - [2. Main config (`config/config.yaml`)](#2-main-config-configconfigyaml)
+  - [3. Configuring the AI model](#3-configuring-the-ai-model)
+  - [4. Configuring individual plugins](#4-configuring-individual-plugins)
+  - [5. Auto-discovery](#5-auto-discovery-scanning-without-manually-specifying-parameters)
+- [Scope Enforcement](#scope-enforcement)
 - [Usage](#usage)
+- [Running with Docker](#running-with-docker)
 - [Reports](#reports)
-- [Extending StelarStrike](#extending-stelarstrike)
+- [Extending StelarStrike (adding a new vulnerability class)](#extending-stelarstrike-adding-a-new-vulnerability-class)
+- [Debugging a scan that finds nothing](#debugging-a-scan-that-finds-nothing)
+- [Testing](#testing)
+- [CI/CD](#cicd)
+- [Roadmap](#roadmap)
 - [Disclaimer](#disclaimer)
 
 ---
 
 ## Why StelarStrike
 
-Most single-purpose scanners check one vulnerability class and stop. StelarStrike is an **orchestrator**: it runs a set of independent vulnerability plugins concurrently against a target, normalizes every result into one `Finding` model, and hands the aggregate to an LLM for triage and report writing.
+Most single-purpose scanners check one vulnerability class and stop. StelarStrike is an **orchestrator**: it runs a set of independent vulnerability plugins concurrently against a target, normalizes every result into one `Finding` model, and hands the aggregate to an LLM for triage (priority ranking, false-positive hints) and report writing — while remaining fully usable with AI turned off.
 
 Design principles:
 
-- **Plugin-first.** Every vulnerability class is an isolated, independently-testable plugin.
-- **Fail closed on scope.** Nothing gets actively tested unless it matches an explicit allowlist.
-- **Passive by default, active by opt-in.** Exploit-confirming payloads only fire when `allow_active_payloads: true`.
-- **AI is a layer, not a dependency.** Every plugin produces useful output with `ai.enabled: false`.
+- **Plugin-first.** Every vulnerability class is an isolated, independently-testable plugin. Adding a new one never requires touching the orchestrator.
+- **Fail closed on scope.** Nothing gets actively tested unless it matches an explicit allowlist in `config.yaml`.
+- **Passive by default, active by opt-in.** Exploit-confirming payloads (time-based SQLi, `alg:none` JWT forgery, file upload probes, etc.) only fire when `engagement.allow_active_payloads: true` is set.
+- **AI is a layer, not a dependency.** Every plugin produces useful, structured output with `ai.enabled: false`. AI only adds triage/report polish on top.
+- **OpenCode AI backend.** Powered by [OpenCode](https://opencode.ai) — install once with `curl -fsSL https://opencode.ai/install | bash`. Default model is `opencode/big-pickle`. Switching models is a one-line change in `.env` (`OPENCODE_MODEL=opencode/big-pickle`). Run `opencode models` to list all available models.
 
----
+## v1.0 Scope
 
-## Methodology
+Version 1.0 ships with **8 vulnerability class plugins**:
 
-StelarStrike implements the **Big Pickle methodology** — a proven 6-phase approach to penetration testing:
+| Plugin ID     | Vulnerability Class              | CWE      |
+| ------------- | --------------------------------- | -------- |
+| `sqli`        | SQL Injection                     | CWE-89   |
+| `nosqli`      | NoSQL Injection (MongoDB-style)   | CWE-943  |
+| `xss`         | Cross-Site Scripting              | CWE-79   |
+| `ssrf`        | Server-Side Request Forgery       | CWE-918  |
+| `csrf`        | Cross-Site Request Forgery        | CWE-352  |
+| `file_upload` | Insecure File Upload              | CWE-434  |
+| `idor`        | Insecure Direct Object Reference  | CWE-639  |
+| `jwt`         | JSON Web Token vulnerabilities    | CWE-347 / CWE-798 / CWE-613 |
 
-### Phase 1: Reconnaissance
-- Spider/crawl target to map all endpoints
-- Extract forms, links, and parameters
-- Technology fingerprinting (headers, errors, content)
+Everything else — engagement modes, additional vuln classes, CI/CD scanning integration, distributed scanning — is intentionally deferred. See [`PRD.md`](./PRD.md) for the full roadmap and design rationale, and [Roadmap](#roadmap) below for a summary.
 
-### Phase 2: Endpoint Enumeration
-- Discover all testable endpoints and parameters
-- Identify hidden endpoints (admin, debug, test)
-- Map parameter types and expected values
-
-### Phase 3: Manual Payload Testing
-- Test each parameter with targeted payloads
-- Error-based, boolean-blind, time-blind, UNION-based
-- Document which parameters are vulnerable
-
-### Phase 4: Automated Tool Verification
-- Use automated tools to verify findings
-- sqlmap for SQLi, dalfox for XSS, ffuf for directories
-- Expand and confirm manual findings
-
-### Phase 5: Data Extraction
-- Extract data from confirmed vulnerabilities
-- Focus on high-value tables (users, admin, auth)
-- Document potential impact
-
-### Phase 6: Documentation
-- Record all findings with evidence
-- Capture proof-of-concept requests/responses
-- Write executive summary with remediation
-
----
+`sqli` is the most developed plugin — it tests query params AND every form on the page (GET, plus POST as both form-encoded and JSON body), covers MySQL/PostgreSQL/MSSQL/SQLite/Oracle error signatures, filters false positives against a baseline request, detects login-form authentication bypass, and (with `allow_active_payloads: true`) confirms UNION-based data-extraction exploitability by column count — without ever actually extracting table data itself. See [Debugging a scan that finds nothing](#debugging-a-scan-that-finds-nothing) if you expect findings and aren't getting any.
 
 ## Architecture
 
@@ -84,28 +82,22 @@ StelarStrike implements the **Big Pickle methodology** — a proven 6-phase appr
 stelarstrike/
 ├── cli.py                  # Typer CLI: scan / plugins / doctor
 ├── core/
-│   ├── config.py           # Loads .env + config.yaml
-│   ├── target.py           # Target model + scope enforcement
-│   ├── orchestrator.py     # Runs plugins concurrently, builds report
-│   ├── ai_client.py        # OPENCODE wrapper (Big Pickle)
-│   └── report.py           # Finding model + report writer
+│   ├── config.py           # Loads .env + config.yaml, resolves ${VAR} placeholders
+│   ├── target.py           # Target model + scope enforcement (fail-closed)
+│   ├── orchestrator.py     # Discovers enabled plugins, runs them concurrently, builds report
+│   ├── ai_client.py        # OpenCode wrapper (Big Pickle model): triage + report + SQLi agent
+│   └── report.py           # Finding model + Markdown/JSON report writer
 ├── plugins/
-│   ├── base.py             # VulnerabilityPlugin ABC
-│   ├── __init__.py         # PLUGIN_REGISTRY
-│   ├── sqli.py             # SQL Injection
-│   ├── nosqli.py           # NoSQL Injection
-│   ├── xss.py              # Cross-Site Scripting
-│   ├── ssrf.py             # Server-Side Request Forgery
-│   ├── csrf.py             # Cross-Site Request Forgery
-│   ├── file_upload.py      # Insecure File Upload
-│   ├── idor.py             # Insecure Direct Object Reference
-│   └── jwt_vuln.py         # JWT vulnerabilities
+│   ├── base.py              # VulnerabilityPlugin ABC + PluginContext
+│   ├── __init__.py          # PLUGIN_REGISTRY — single source of truth for enabled plugins
+│   ├── sqli.py / nosqli.py / xss.py / ssrf.py / csrf.py
+│   └── file_upload.py / idor.py / jwt_vuln.py
 └── utils/
-    ├── logger.py           # Structured logging
-    └── http_client.py      # HTTP helpers
+    ├── logger.py            # rich-based structured logging
+    └── http_client.py       # form/param/URL parsing helpers shared by plugins
 ```
 
----
+**Flow:** `cli.scan` → loads `Settings` → `Orchestrator.run(target_url)` → scope check → instantiate every enabled plugin from `PLUGIN_REGISTRY` → run concurrently via `asyncio` (bounded by `http.max_concurrency`) → collect `Finding`s into `ReportBuilder` → optional AI triage/narrative → write `.md` / `.json` to `reports/`.
 
 ## Installation
 
@@ -116,21 +108,98 @@ git clone https://github.com/ronaega/stelarstrike.git
 cd stelarstrike
 
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
 pip install -e ".[dev]"
+# or, without editable/dev extras:
+# pip install -r requirements.txt
 ```
 
-Verify:
+### Install OpenCode (AI backend)
+
+StelarStrike uses **OpenCode** (https://opencode.ai) for AI-powered triage, report writing, and intelligent SQLi analysis. The default model is **Big Pickle** (`opencode/big-pickle`).
+
+```bash
+# Install OpenCode — one-time setup
+curl -fsSL https://opencode.ai/install | bash
+
+# Verify
+opencode --version
+
+# See available models (Big Pickle is the default)
+opencode models
+```
+
+OpenCode is optional — if it is not installed, all scans still run fully and findings are still reported. AI features (narrative, triage, SQLi agent) are just skipped with a clear warning.
+
+Verify the full install:
 
 ```bash
 stelarstrike --help
 stelarstrike plugins
+stelarstrike doctor   # checks OpenCode is installed and model is configured
 ```
 
----
+## Uninstalling
+
+To fully remove StelarStrike:
+
+```bash
+# 1. Deactivate the virtual environment (if active)
+deactivate
+
+# 2. Remove the project folder (contains the code, venv, reports, config)
+rm -rf /path/to/stelarstrike
+
+# 3. If you installed globally (without a venv), uninstall the package
+pip uninstall stelarstrike -y
+```
+
+If you only want to remove the package from a virtual environment but keep the folder:
+
+```bash
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip uninstall stelarstrike -y
+```
+
+To confirm it's gone:
+
+```bash
+stelarstrike --help   # should return "command not found"
+pip show stelarstrike  # should return nothing
+```
+
+## Updating
+
+If you already cloned this repo and want to pull in the latest changes:
+
+```bash
+git pull origin main
+pip install -e ".[dev]"    # picks up any new/changed dependencies
+```
+
+A few notes:
+
+- **If `git pull` complains about local changes**, it means you've edited a tracked file (e.g. `README.md`, `pyproject.toml`). Your `config/config.yaml` and `.env` are git-ignored, so they're never affected by this. To handle local edits:
+  ```bash
+  git stash          # temporarily shelve your local edits
+  git pull origin main
+  git stash pop       # reapply your edits on top of the update
+  ```
+- **To see what changed before pulling:**
+  ```bash
+  git fetch origin
+  git log HEAD..origin/main --oneline
+  ```
+- **After updating, check `config/config.example.yaml` and `.env.example` for new keys** — an update may add config options (like `discovery:` or new plugin settings) that won't automatically appear in your own `config.yaml`/`.env` since those are your local, git-ignored copies. Diff them manually:
+  ```bash
+  diff config/config.yaml config/config.example.yaml
+  diff .env .env.example
+  ```
 
 ## Configuration
+
+StelarStrike is configured in two layers: a **`.env`** file for secrets/environment-specific values, and a **`config/config.yaml`** file for engagement and plugin behavior. `config.yaml` can reference `.env` values using `${VAR_NAME}` or `${VAR_NAME:-default}` syntax.
 
 ### 1. Environment variables (`.env`)
 
@@ -138,17 +207,19 @@ stelarstrike plugins
 cp .env.example .env
 ```
 
-Key settings:
+Then edit `.env`. Key sections:
 
 ```dotenv
-# AI provider (OPENCODE Big Pickle)
-STELAR_AI_PROVIDER=opencode/big-pickle
+# OpenCode AI backend — default model is Big Pickle
 STELAR_AI_ENABLED=true
+OPENCODE_MODEL=opencode/big-pickle
 
 # Safety switches
 STELAR_REQUIRE_SCOPE_FILE=true
 STELAR_ALLOW_ACTIVE_PAYLOADS=false
 ```
+
+Full list of variables and comments: [`.env.example`](./.env.example).
 
 ### 2. Main config (`config/config.yaml`)
 
@@ -156,102 +227,219 @@ STELAR_ALLOW_ACTIVE_PAYLOADS=false
 cp config/config.example.yaml config/config.yaml
 ```
 
-Minimum to edit:
+`config/config.yaml` is git-ignored on purpose (see `.gitignore`) — it's meant to hold your **real** engagement scope, which you should not commit. Only `config.example.yaml` is tracked in git.
+
+Minimum you need to edit before your first scan:
 
 ```yaml
 engagement:
-  name: "my-engagement"
+  name: "my-first-engagement"
   scope:
-    - "https://target.example.com/*"
-  allow_active_payloads: false
+    - "https://target.example.com/*"   # <-- your authorized target(s)
+  allow_active_payloads: false          # keep false until you've reviewed what "active" means (see below)
 ```
 
-### 3. Plugin configuration
+### 3. Configuring the AI model (OpenCode)
+
+StelarStrike uses **OpenCode** as its AI backend. No API keys or Python AI packages needed — just install OpenCode and it handles everything:
+
+```bash
+# Install once
+curl -fsSL https://opencode.ai/install | bash
+
+# List available models
+opencode models
+
+# Change model in .env
+OPENCODE_MODEL=opencode/big-pickle   # default (recommended)
+```
+
+Available models are listed by `opencode models`. The default `opencode/big-pickle` is the model used during development and testing.
+
+To disable AI entirely (scans still run fully, just no narrative/triage):
+
+```yaml
+ai:
+  enabled: false
+```
+
+AI roles (each independently toggleable in `config.yaml`):
+
+```yaml
+ai:
+  roles:
+    triage: true         # rank/deduplicate findings by exploitability
+    report_writer: true  # draft the executive-summary narrative in the report
+    sqli_agent: true     # iterative AI agent for difficult SQLi targets
+```
+
+### 4. Configuring individual plugins
+
+Each plugin is toggled and tuned under `plugins:` in `config.yaml`:
 
 ```yaml
 plugins:
   sqli:
     enabled: true
-    techniques: ["error-based", "boolean-blind", "time-blind"]
-    time_delay_seconds: 5
+    max_tables: 10       # max tables to enumerate columns for
   nosqli:
+
     enabled: true
   xss:
     enabled: true
+    contexts: ["reflected"]
   ssrf:
     enabled: true
+    collaborator_url: ""     # your own Interactsh/Burp Collaborator/webhook.site URL
   csrf:
     enabled: true
+    check_samesite: true
   file_upload:
     enabled: true
+    test_extensions: [".php", ".php5", ".phtml", ".svg", ".jsp", ".asp"]
   idor:
     enabled: true
+    id_param_hints: ["id", "user_id", "uid", "account", "order_id"]
   jwt:
     enabled: true
+    checks: ["alg-none", "weak-secret", "kid-injection", "expired-token-reuse"]
 ```
 
-### 4. Auto-discovery
+Set `enabled: false` on any plugin you don't want to run for a given engagement — disabled plugins are skipped entirely (no network calls, no findings).
 
-Plugins need parameters to test. Discovery crawls the target to find them:
+**Passive vs. active checks:** every plugin runs safe, passive/detection-only checks by default. Checks that require sending an exploit-confirming payload (time-based SQLi, `alg:none` JWT forgery, real file upload probes, SSRF out-of-band probes) are additionally gated by the top-level:
+
+```yaml
+engagement:
+  allow_active_payloads: false   # set true only once you've confirmed you're authorized for active testing
+```
+
+### 5. Auto-discovery (scanning without manually specifying parameters)
+
+Plugins like `sqli`, `nosqli`, `idor`, and `ssrf` need a query parameter to test. If you pass `scan` a bare URL with no query string, StelarStrike doesn't just give up — it crawls the page for same-origin links and forms one level deep, converts any GET forms it finds into parametrized URLs, and scans all of them. If nothing parametrized turns up anywhere, it falls back to guessing a small set of common parameter names (`id`, `page`, `search`, `q`, ...) against your original URL so injection-style plugins still have something to probe.
+
+Every discovered URL is re-checked against `engagement.scope` before it's touched — discovery can only narrow within scope you already approved, never widen it, and it never follows links to a different origin.
 
 ```yaml
 discovery:
   enabled: true
   max_urls: 10
   max_depth: 1
-  synthetic_params: ["id", "page", "search", "q", "user_id"]
+  synthetic_params: ["id", "page", "category", "search", "q", "user_id"]
 ```
 
----
+Set `discovery.enabled: false` if you want StelarStrike to scan *exactly* the URL you passed and nothing else.
+
+## Scope Enforcement
+
+Before any plugin runs, `stelarstrike/core/target.py` checks the target URL/host against `engagement.scope` and `engagement.out_of_scope` (glob patterns). If the target doesn't match an entry in `scope`, or matches an entry in `out_of_scope`, the scan is refused with a `ScopeError` before a single request is sent.
+
+```yaml
+engagement:
+  scope:
+    - "https://target.example.com/*"
+    - "*.staging.example.com"
+  out_of_scope:
+    - "https://target.example.com/admin/*"
+```
 
 ## Usage
 
 ```bash
-# List plugins
+# List all registered plugins
 stelarstrike plugins
 
-# Full scan
-stelarstrike scan "https://target.example.com/"
+# Sanity-check your configuration + AI connectivity
+stelarstrike doctor
 
-# Specific plugins
+# Run a full scan (all plugins enabled in config.yaml)
+stelarstrike scan "https://target.example.com/page?id=1" \
+  --config config/config.yaml \
+  --formats markdown,json
+
+# Run only specific plugins for this scan, regardless of config.yaml's enabled flags
 stelarstrike scan "https://target.example.com/" --plugins sqli,xss
 
-# Verbose output
+# See every request/payload each plugin tries — use this when a scan
+# finds nothing and you need to see what actually happened
 stelarstrike scan "https://target.example.com/" --plugins sqli --verbose
 ```
 
-### SQLi Scanning Example
+`--plugins` is a one-off override for a single run — it doesn't change `config.yaml`. Omit it and StelarStrike runs whatever's enabled in your config (all 8, by default). Use `--plugins` when you want to iterate quickly on one vulnerability class (e.g. tuning `sqli` against a specific target) without editing the config file each time.
 
-```bash
-# Basic SQLi scan
-stelarstrike scan "http://target.com/?id=1" --plugins sqli
+Sample output:
 
-# With active payloads (UNION, time-based)
-stelarstrike scan "http://target.com/" --plugins sqli --verbose
+```
+                 ▒---------------------------
+                   ░----- LET'S STRIKE ------
+                    ▒---------- BABY ! ! ! --
+       ░░            ░-----------------------
+   ░░░▒░░░▒▒▓▓▒░     ░▒-----------██▓▒▓███---
+ ░▒▓▓▓▓▓▓▓▓▓▓▓▒▓▒░     ▒------███▓▒░░▒▒▒▒▓██-
+▒▓▓▓▓▒░░░░▒▓████▓▒░    ░----█▓▓▓▒░░░▒▒▒▒▒▒▒▒▓
+▓▓▓▓▒░░░▒░ ░▒▓███▓░   ░----█▒▒▓▒░░▒▒▒▒▒▒▒▒▒▒▒
+▓▓███▒░   ░░▒▓▓▒▒▓▒  ▒-----▓▒▒░░░▒▒▒▒▒▒▒▒░░░░
+▓▓████▒░░▒▒▓█▓░░ ░░░-------▒▒░░░░░░░▒▒▒▒░░░░░
+▓▓▓██████████▓  ░░▒--------░▒▒░░   ░░▒▒░░   ░
+▒▒▒▒▒▒▓▓█████▓░░░---------▓░░░░░░░░░░▓█▓▒░░▒▓
+░▒░░▓▓▓░░▒▓▓█▓▓-----------▓▒▒▒▒▒▒▒▒▒▒████████
+░▒░ ░░▒░░░░░░▓▓------------▒▒▒▒▓▓▓▒▒▒▒▓▓▓▒▒▓█
+░░▒▒▒▒▒░░░░░░▒▒------------▓░▒▓▓▓▒▒▒▒░░▓██▒▒▒
+░░▒▒▒░░▒░░ ░░▒▓-------------▒▒▒▓▒▒░░░▒▒▒▒░░░▒
+░░░▒▒▒░░░░░░  ▒-------------▒▒▒▓▒▒▒▒▒░░▒▓██▒▒
+░░░░░░░░░      ░▒-----------░░░▒▒▒▒▒▒▒▒▒▒▓▓▒▒
+░░░░             ░▓--------░░░░░░░▒▒▒▒▒▓▓▓▒▒▒
+         S T E L A R S T R I K E
+               by Stelariux
+                v0.1.0-dev
+─────────────────────────────────────────────
 
-# Test forms
-stelarstrike scan "http://target.com/login" --plugins sqli
+Scanning: https://target.example.com/
+Engagement: my-first-engagement | AI: on (anthropic/claude-sonnet-4-6) | Discovery: on
+[INFO] Discovery: scanning 4 URL(s): ['https://target.example.com/', 'https://target.example.com/product?id=1', 'https://target.example.com/search?q=1', ...]
+
+                     Findings — my-first-engagement
+┏━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┓
+┃ Severity     ┃ Plugin  ┃ Title                            ┃ Parameter ┃
+┡━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━┩
+│ HIGH         │ sqli    │ SQL Injection (error-based)       │ id        │
+│ MEDIUM       │ csrf    │ CSRF: form lacks anti-CSRF token  │ /login    │
+└──────────────┴─────────┴──────────────────────────────────┴───────────┘
+2 total finding(s).
+Report written: reports/my-first-engagement-20260709-142200.md
+Report written: reports/my-first-engagement-20260709-142200.json
 ```
 
-The SQLi plugin tests:
-- Error-based injection (MySQL, PostgreSQL, MSSQL, SQLite, Oracle)
-- Boolean-blind injection
-- Time-blind injection
-- UNION-based column counting
-- Form field injection
+Note: if you pass a URL that already has a query string (e.g. `?id=1`), StelarStrike scans that exact URL plus anything else it discovers — it never skips the URL you explicitly gave it.
 
----
+## Running with Docker
+
+```bash
+docker build -t stelarstrike:local .
+
+docker run --rm \
+  --env-file .env \
+  -v "$(pwd)/config:/app/config:ro" \
+  -v "$(pwd)/reports:/app/reports" \
+  stelarstrike:local scan "https://target.example.com" --config /app/config/config.yaml
+```
+
+Or with docker-compose (edit the target URL in `docker-compose.yml` first):
+
+```bash
+docker compose up --build
+```
 
 ## Reports
 
-Reports are written to `reports/` as:
+Reports are written to `reports/` (configurable via `STELAR_REPORT_DIR` / `project.report_dir`) as:
 
-- **`<engagement>-<timestamp>.md`** — Human-readable report with executive summary, findings, evidence, remediation.
-- **`<engagement>-<timestamp>.json`** — Structured data for other tooling.
+- **`<engagement>-<timestamp>.md`** — human-readable report: AI-drafted executive summary (or a deterministic fallback if AI is disabled), findings grouped and sorted by severity, evidence, and remediation guidance.
+- **`<engagement>-<timestamp>.json`** — the same data in structured form, for feeding into other tooling (ticketing systems, dashboards, CI gates).
 
----
+`reports/` is git-ignored by default — engagement findings can be sensitive and generally shouldn't be committed to a public repo.
 
-## Extending StelarStrike
+## Extending StelarStrike (adding a new vulnerability class)
 
 1. Create `stelarstrike/plugins/your_vuln.py`:
 
@@ -262,38 +450,66 @@ from stelarstrike.plugins.base import VulnerabilityPlugin
 class YourVulnPlugin(VulnerabilityPlugin):
     id = "your_vuln"
     name = "Your Vulnerability Class"
+    default_severity = "medium"
 
     async def run(self) -> list[Finding]:
         findings = []
-        # Your detection logic
+        # ... your detection logic using self.get()/self.post() ...
         return findings
 ```
 
-2. Register in `plugins/__init__.py`:
+2. Register it in `stelarstrike/plugins/__init__.py`:
 
 ```python
 from stelarstrike.plugins.your_vuln import YourVulnPlugin
 PLUGIN_REGISTRY["your_vuln"] = YourVulnPlugin
 ```
 
-3. Add config section to `config/config.yaml`.
+3. Add a matching section to `config/config.example.yaml` under `plugins:`.
 
----
+That's it — the orchestrator, CLI, and reporting layer all pick it up automatically through `PLUGIN_REGISTRY`.
 
-## Tools Reference
+## Debugging a scan that finds nothing
 
-StelarStrike can suggest external tools for deeper testing:
+If a scan comes back empty and you expected findings, work through this in order:
 
-| Tool | Purpose | Command |
-|------|---------|---------|
-| sqlmap | SQL injection | `sqlmap -u "target/?id=1" --batch` |
-| dalfox | XSS scanning | `dalfox url "target/?q=test"` |
-| ffuf | Directory brute-force | `ffuf -u "target/FUZZ" -w wordlist.txt` |
-| nikto | Web server scan | `nikto -h target` |
-| whatweb | Technology fingerprint | `whatweb target` |
+1. **Run with `--verbose`.** This is the fastest diagnostic — it logs every payload each plugin sends and the response it got back, so you can see exactly what was tried instead of guessing:
+   ```bash
+   stelarstrike scan "http://target/" --plugins sqli --verbose
+   ```
+2. **Check the `Discovery: scanning N URL(s): [...]` log line.** If discovery only found the bare URL you passed (no `?id=`, `?q=`, etc.), the target may not expose links/forms the crawler can see from that starting page — point `scan` directly at a page with a form or parameter instead (a login page, search box, product page), or increase `discovery.max_depth`/`max_urls` in `config.yaml`.
+3. **Confirm `allow_active_payloads` matches what you actually want tested.** Time-blind SQLi, UNION confirmation, and auth-bypass checks all require it to be `true`. Passive-only (`false`) will legitimately find nothing on a target whose only vulnerability requires an active probe.
+4. **If it's SQLi specifically:** the target's DBMS matters. `sqli` tries MySQL/PostgreSQL/MSSQL/SQLite/Oracle signatures and time-based payloads, but an unusual or heavily customized error-handling setup can still swallow every signal. `--verbose` will show you the raw response bodies coming back so you can add a missing signature yourself if needed (`_ERROR_SIGNATURES` in `stelarstrike/plugins/sqli.py`).
+5. **Check you're actually reaching the target at all.** A silently-failing connection (wrong port, target down, VPN/lab not connected) looks identical to "no vulnerabilities found" unless you're watching `--verbose` output for connection errors.
 
----
+## Testing
+
+```bash
+pytest -v
+ruff check stelarstrike tests
+mypy stelarstrike --ignore-missing-imports
+```
+
+## CI/CD
+
+`.github/workflows/ci.yml` runs on every push/PR to `main`:
+
+1. Install deps, lint with `ruff`, type-check with `mypy`, run `pytest`.
+2. Build the Docker image and sanity-check it (`stelarstrike plugins` inside the container).
+
+No live scanning happens in CI by default — wire up `STELAR_CI_TARGET_URL` as a repo secret if you want to add an authorized-target smoke scan job later.
+
+## Roadmap
+
+See [`PRD.md`](./PRD.md) for the full breakdown. Summary of what's deliberately **out of scope for v1.0**:
+
+- Additional vuln classes (RCE, XXE, SSTI, deserialization, HTTP request smuggling, open redirect, business logic, race conditions)
+- Engagement modes (bug-bounty / red-team / CTF presets)
+- Distributed/parallel multi-target scanning
+- Built-in OOB collaborator server (currently bring-your-own)
+- Web UI / dashboard
+- Authenticated scanning session management (login flows, multi-step auth)
 
 ## Disclaimer
 
-StelarStrike is provided for **authorized security testing and educational purposes only**. Only run it against systems you own or have explicit, documented permission to test. The authors are not responsible for misuse or damage caused by this tool. Suwun!
+StelarStrike is provided for **authorized security testing and educational purposes only**. Only run it against systems you own or have explicit, documented permission to test. The authors and contributors are not responsible for misuse or damage caused by this tool. Running active checks (`engagement.allow_active_payloads: true`) against a target without authorization is illegal in most jurisdictions.

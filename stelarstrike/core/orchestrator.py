@@ -95,6 +95,12 @@ class Orchestrator:
 
                 log.info(f"Discovery + Schema: scanning {len(target_urls)} URL(s)")
 
+            # Schema provides category-level sqli hints (positions to try first, likely DB).
+            # These are soft hints — the extractor still runs full enumeration if they miss.
+            schema_sqli_hints: dict[str, Any] = {}
+            if self.matched_schema:
+                schema_sqli_hints = self.matched_schema.get_sqli_hints()
+
             tasks = []
             for url in target_urls:
                 url_target = Target(url=url)
@@ -109,7 +115,13 @@ class Orchestrator:
                             continue
 
                     merged_options = {**plugin_cfg.options}
-
+                    if plugin_id == "sqli":
+                        if schema_sqli_hints:
+                            merged_options["schema_hints"] = schema_sqli_hints
+                        merged_options["_ai_config"] = {
+                            "enabled": self.settings.ai.enabled,
+                            "provider": self.settings.ai.provider,
+                        }
                     ctx = PluginContext(
                         target=url_target,
                         http_client=http_client,

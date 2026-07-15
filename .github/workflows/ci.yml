@@ -18,9 +18,6 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install opencode
-        run: curl -fsSL https://opencode.ai/install | bash
-
       - name: Install dependencies
         run: |
           pip install -e ".[dev]"

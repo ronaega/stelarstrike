@@ -52,9 +52,8 @@ class PluginConfig(BaseModel):
 
 class AIConfig(BaseModel):
     enabled: bool = True
-    provider: str = "opencode/big-pickle"
+    provider: str = "gpt-4o"   # OpenCode default — "big-pickle" maps to gpt-4o
     max_tokens: int = 2000
-    temperature: float = 0.2
     roles: dict[str, bool] = Field(default_factory=dict)
 
 

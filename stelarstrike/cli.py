@@ -178,12 +178,15 @@ def doctor(config: str = typer.Option("config/config.yaml", "--config", "-c")):
         console.print(f"[green]OK[/] Scope: {settings.engagement.scope}")
 
     if settings.ai.enabled:
-        try:
-            import litellm  # noqa: F401
-
-            console.print(f"[green]OK[/] litellm installed; AI provider configured as '{settings.ai.provider}'")
-        except ImportError:
-            console.print("[yellow]WARN[/] AI enabled in config but litellm is not installed (`pip install litellm`)")
+        import shutil as _shutil
+        opencode_path = _shutil.which("opencode")
+        if opencode_path:
+            console.print(f"[green]OK[/] OpenCode found at '{opencode_path}'; model configured as '{settings.ai.provider}'")
+        else:
+            console.print(
+                "[yellow]WARN[/] AI enabled in config but OpenCode is not installed. "
+                "Run: curl -fsSL https://opencode.ai/install | bash"
+            )
     else:
         console.print("[cyan]INFO[/] AI features disabled in config.")
 
