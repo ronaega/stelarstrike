@@ -22,6 +22,10 @@ reports/*
 # PRD — internal planning document, not for public repo
 PRD.md
 
+# Agent conversation files — private, never commit
+agents/*
+!agents/.gitkeep
+
 # Editors / OS
 .vscode/
 .idea/
