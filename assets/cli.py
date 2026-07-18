@@ -9,10 +9,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from stelarstrike.core.config import load_settings
-from stelarstrike.core.orchestrator import Orchestrator
-from stelarstrike.core.target import ScopeError
-from stelarstrike.plugins import PLUGIN_REGISTRY
+from assets.core.config import load_settings
+from assets.core.orchestrator import Orchestrator
+from assets.core.target import ScopeError
+from assets.plugins import PLUGIN_REGISTRY
 
 app = typer.Typer(
     name="stelarstrike",
@@ -68,7 +68,7 @@ def scan(
         logging.getLogger().setLevel(logging.DEBUG)
 
     console.print(BANNER, style="bold cyan", markup=False, highlight=False)
-    settings = load_settings(config)
+    settings = load_settings(config if config != "config/config.yaml" else None)
 
     plugin_filter: set[str] | None = None
     if plugins_opt:
@@ -95,7 +95,7 @@ def scan(
         console.print(f"[bold red]Scope error:[/] {exc}")
         raise typer.Exit(code=1)
 
-    if orchestrator.matched_schema:
+    if getattr(orchestrator, "matched_schema", None):
         console.print(f"[bold green]Pattern matched:[/] {orchestrator.matched_schema.name}")
 
     _print_summary(report)
@@ -117,7 +117,7 @@ def createagent(
     target: str = typer.Argument(..., help="Target URL this agent will operate on"),
 ):
     """Create a new agent. Target is automatically authorized for active scanning."""
-    from stelarstrike.core.agent import create_agent  # noqa: PLC0415
+    from assets.core.agent import create_agent  # noqa: PLC0415
     msg = create_agent(name, target)
     if msg.startswith("Error") or msg == "The agent exists":
         console.print(f"[bold red]{msg}[/]")
@@ -130,7 +130,7 @@ def deleteagent(
     name: str = typer.Argument(..., help="Agent name to delete"),
 ):
     """Delete an existing agent and its conversation history."""
-    from stelarstrike.core.agent import delete_agent  # noqa: PLC0415
+    from assets.core.agent import delete_agent  # noqa: PLC0415
     msg = delete_agent(name)
     if msg.startswith("Error"):
         console.print(f"[bold red]{msg}[/]")
@@ -141,7 +141,7 @@ def deleteagent(
 @app.command(name="--agents")
 def agents_list():
     """List all agents and their assigned targets."""
-    from stelarstrike.core.agent import list_agents  # noqa: PLC0415
+    from assets.core.agent import list_agents  # noqa: PLC0415
     rows = list_agents()
     if not rows:
         console.print("[dim]No agents found. Create one with: stelarstrike --createagent <name> <target>[/]")
@@ -165,7 +165,7 @@ def agents_list():
 @app.command(name="--skills")
 def skills_list():
     """List all available skills and their descriptions."""
-    from stelarstrike.core.agent import list_skills  # noqa: PLC0415
+    from assets.core.agent import list_skills  # noqa: PLC0415
     rows = list_skills()
     table = Table(title="StelarStrike Skills")
     table.add_column("Skill", style="bold")
@@ -179,7 +179,7 @@ def skills_list():
 @app.command(name="--tools")
 def tools_list():
     """List all available tools and their descriptions."""
-    from stelarstrike.core.agent import list_tools  # noqa: PLC0415
+    from assets.core.agent import list_tools  # noqa: PLC0415
     rows = list_tools()
     if not rows:
         console.print("[yellow]No tools found.[/]")
@@ -279,7 +279,7 @@ def doctor(config: str = typer.Option("config/config.yaml", "--config", "-c")):
 
 def run_agent_chat(agent_name: str, raw_prompt: str | None) -> None:
     """Handle `stelarstrike <agent> "<prompt>"` invocations."""
-    from stelarstrike.core.agent import (  # noqa: PLC0415
+    from assets.core.agent import (  # noqa: PLC0415
         agent_exists,
         handle_prompt,
         validate_name,

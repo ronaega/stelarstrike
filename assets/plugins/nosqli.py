@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import json
 
-from stelarstrike.core.report import Finding
-from stelarstrike.plugins.base import VulnerabilityPlugin
-from stelarstrike.utils.http_client import get_query_params
+from assets.core.report import Finding
+from assets.plugins.base import VulnerabilityPlugin
+from assets.utils.http_client import get_query_params
 
 _NOSQL_ERROR_SIGNATURES = [
     "mongoerror",

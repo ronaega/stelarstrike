@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import re
 
-from stelarstrike.core.report import Finding
-from stelarstrike.plugins.base import VulnerabilityPlugin
-from stelarstrike.utils.http_client import build_url_with_params, get_query_params
+from assets.core.report import Finding
+from assets.plugins.base import VulnerabilityPlugin
+from assets.utils.http_client import build_url_with_params, get_query_params
 
 _INT_RE = re.compile(r"^\d+$")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)

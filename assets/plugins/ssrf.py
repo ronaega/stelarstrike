@@ -17,9 +17,9 @@ StelarStrike does not ship a built-in collaborator; wire up your own
 
 from __future__ import annotations
 
-from stelarstrike.core.report import Finding
-from stelarstrike.plugins.base import VulnerabilityPlugin
-from stelarstrike.utils.http_client import build_url_with_params, get_query_params
+from assets.core.report import Finding
+from assets.plugins.base import VulnerabilityPlugin
+from assets.utils.http_client import build_url_with_params, get_query_params
 
 _SUSPICIOUS_PARAM_HINTS = [
     "url", "uri", "path", "dest", "destination", "redirect", "target",

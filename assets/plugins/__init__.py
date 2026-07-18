@@ -10,14 +10,14 @@ Nothing else in the codebase needs to change — the orchestrator and
 CLI both discover plugins purely through this dict.
 """
 
-from stelarstrike.plugins.csrf import CSRFPlugin
-from stelarstrike.plugins.file_upload import FileUploadPlugin
-from stelarstrike.plugins.idor import IDORPlugin
-from stelarstrike.plugins.jwt_vuln import JWTPlugin
-from stelarstrike.plugins.nosqli import NoSQLiPlugin
-from stelarstrike.plugins.sqli import SQLiPlugin
-from stelarstrike.plugins.ssrf import SSRFPlugin
-from stelarstrike.plugins.xss import XSSPlugin
+from assets.plugins.csrf import CSRFPlugin
+from assets.plugins.file_upload import FileUploadPlugin
+from assets.plugins.idor import IDORPlugin
+from assets.plugins.jwt_vuln import JWTPlugin
+from assets.plugins.nosqli import NoSQLiPlugin
+from assets.plugins.sqli import SQLiPlugin
+from assets.plugins.ssrf import SSRFPlugin
+from assets.plugins.xss import XSSPlugin
 
 PLUGIN_REGISTRY = {
     "sqli": SQLiPlugin,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from stelarstrike.core.agent import (
+from assets.core.agent import (
     _is_action_prompt,
     _detect_relevant_skill,
     create_agent,
@@ -74,7 +74,7 @@ def test_name_numeric_only():
 def _run_in_tmp(fn):
     """Run a function with agents/ pointing at a temp directory."""
     with tempfile.TemporaryDirectory() as tmp:
-        import stelarstrike.core.agent as agent_mod
+        import assets.core.agent as agent_mod
         original = agent_mod.AGENTS_DIR
         agent_mod.AGENTS_DIR = Path(tmp) / "agents"
         try:
@@ -89,7 +89,7 @@ def test_create_agent_success():
         assert "created" in msg.lower()
         assert (agent_mod.AGENTS_DIR / "rex.md").exists()
 
-    import stelarstrike.core.agent as agent_mod
+    import assets.core.agent as agent_mod
     _run_in_tmp(run)
 
 
@@ -117,7 +117,7 @@ def test_delete_agent_success():
         assert "deleted" in msg.lower()
         assert not (agent_mod.AGENTS_DIR / "del01.md").exists()
 
-    import stelarstrike.core.agent as agent_mod
+    import assets.core.agent as agent_mod
     _run_in_tmp(run)
 
 

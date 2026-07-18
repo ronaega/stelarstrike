@@ -18,6 +18,10 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
+from assets.utils.logger import get_logger
+
+log = get_logger(__name__)
+
 _VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(:-([^}]*))?\}")
 
 
@@ -87,35 +91,60 @@ class Settings(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
-def load_settings(config_path: str | Path | None = None) -> Settings:
-    """Load .env then config.yaml, interpolate env vars, return a Settings object."""
+def load_settings(config_path: str | Path | None = None, overrides: dict | None = None) -> Settings:
+    """
+    Load .env then config.yaml, interpolate env vars, return a Settings object.
+
+    config.yaml is now OPTIONAL. When it does not exist, sensible defaults are
+    used for everything. Scope comes from the agent file when invoked via an agent;
+    when invoked via `stelarstrike scan`, the user should have a config.yaml with
+    scope set — but if not, the scan will proceed with an empty scope (warn-only).
+
+    `overrides` lets callers (e.g. agent dispatch) inject values like scope and
+    engagement name without touching the config file.
+    """
     load_dotenv(override=False)
 
+    raw: dict = {}
     path = Path(config_path or os.environ.get("STELAR_CONFIG_PATH", "config/config.yaml"))
-    if not path.exists():
-        example = path.with_name(path.stem + ".example" + path.suffix)
-        raise FileNotFoundError(
-            f"Config file not found at '{path}'. "
-            f"Copy '{example}' to '{path}' and edit it, "
-            f"or set STELAR_CONFIG_PATH to point elsewhere."
-        )
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        raw = _interpolate(raw)
+    else:
+        load_dotenv(override=False)  # still load .env even without config.yaml
 
-    with path.open("r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
-
-    raw = _interpolate(raw)
+    # Apply overrides (from agent dispatch, CLI flags, etc.)
+    if overrides:
+        for section, values in overrides.items():
+            if section not in raw:
+                raw[section] = {}
+            if isinstance(values, dict):
+                raw[section].update(values)
 
     plugins_raw = raw.get("plugins", {}) or {}
+    # All plugins enabled by default when no config.yaml
+    if not plugins_raw:
+        from assets.plugins import PLUGIN_REGISTRY  # noqa: PLC0415
+        plugins_raw = {pid: {"enabled": True} for pid in PLUGIN_REGISTRY}
+
     plugins = {
         name: PluginConfig(enabled=bool(cfg.get("enabled", True)), options=cfg)
         for name, cfg in plugins_raw.items()
     }
 
+    engagement_raw = raw.get("engagement", {})
+    if not engagement_raw.get("scope") and not (overrides or {}).get("engagement", {}).get("scope"):
+        log.warning(
+            "No scope defined in config.yaml or agent. Scoping is open — "
+            "only scan targets you are authorized to test."
+        )
+
     settings = Settings(
         project_name=raw.get("project", {}).get("name", "StelarStrike"),
         report_dir=raw.get("project", {}).get("report_dir", "reports"),
         log_level=raw.get("project", {}).get("log_level", "INFO"),
-        engagement=EngagementConfig(**raw.get("engagement", {})),
+        engagement=EngagementConfig(**engagement_raw),
         discovery=DiscoveryConfig(**raw.get("discovery", {})),
         http=HttpConfig(**raw.get("http", {})),
         plugins=plugins,

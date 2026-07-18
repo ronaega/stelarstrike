@@ -20,8 +20,8 @@ import shutil
 import subprocess
 from typing import Any
 
-from stelarstrike.core.config import AIConfig
-from stelarstrike.utils.logger import get_logger
+from assets.core.config import AIConfig
+from assets.utils.logger import get_logger
 
 log = get_logger(__name__)
 

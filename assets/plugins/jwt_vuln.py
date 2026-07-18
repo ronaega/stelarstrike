@@ -19,8 +19,8 @@ import time
 
 import jwt
 
-from stelarstrike.core.report import Finding
-from stelarstrike.plugins.base import VulnerabilityPlugin
+from assets.core.report import Finding
+from assets.plugins.base import VulnerabilityPlugin
 
 _COMMON_WEAK_SECRETS = [
     "secret", "password", "123456", "changeme", "jwtsecret", "your-256-bit-secret",

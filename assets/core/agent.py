@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from stelarstrike.utils.logger import get_logger
+from assets.utils.logger import get_logger
 
 log = get_logger(__name__)
 

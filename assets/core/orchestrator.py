@@ -17,15 +17,14 @@ from typing import Any
 
 import httpx
 
-from stelarstrike.core.ai_client import AIClient
-from stelarstrike.core.config import PluginConfig, Settings
-from stelarstrike.core.discovery import discover_targets
-from stelarstrike.core.report import Finding, ReportBuilder
-from stelarstrike.core.schema_loader import match_schema
-from stelarstrike.core.target import Target, enforce_scope
-from stelarstrike.plugins import PLUGIN_REGISTRY
-from stelarstrike.plugins.base import PluginContext
-from stelarstrike.utils.logger import get_logger
+from assets.core.ai_client import AIClient
+from assets.core.config import PluginConfig, Settings
+from assets.core.discovery import discover_targets
+from assets.core.report import Finding, ReportBuilder
+from assets.core.target import Target, enforce_scope
+from assets.plugins import PLUGIN_REGISTRY
+from assets.plugins.base import PluginContext
+from assets.utils.logger import get_logger
 
 log = get_logger(__name__)
 
@@ -34,7 +33,6 @@ class Orchestrator:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.ai_client = AIClient(settings.ai)
-        self.matched_schema = None  # set after schema check; readable by tests/CLI
 
     async def run(self, target_url: str, plugin_filter: set[str] | None = None) -> ReportBuilder:
         target = Target(url=target_url)
@@ -61,15 +59,9 @@ class Orchestrator:
         ) as http_client:
             semaphore = asyncio.Semaphore(self.settings.http.max_concurrency)
 
-            # Schema pattern matching — check against generic stack patterns (Flask, Django, etc.)
-            # A match ADDS probe endpoints and GUIDES enumeration — never bypasses it.
-            self.matched_schema = await match_schema(target_url, http_client)
-            if self.matched_schema:
-                log.info(self.matched_schema.summary())
-
+            # Discover target URLs (scope is enforced at entry — no schema system needed)
             target_urls = [target_url]
             if self.settings.discovery.enabled:
-                # Always run discovery
                 discovered = await discover_targets(
                     base_url=target_url,
                     http_client=http_client,
@@ -80,26 +72,7 @@ class Orchestrator:
                     synthetic_params=self.settings.discovery.synthetic_params,
                 )
                 target_urls = list(dict.fromkeys(discovered))
-
-                # Schema matched — also add its pattern probe endpoints (alongside discovery)
-                if self.matched_schema:
-                    base_host = target_url.rstrip("/")
-                    added = 0
-                    for ep in self.matched_schema.probe_endpoints:
-                        ep_url = base_host + ep["path"]
-                        if ep_url not in target_urls:
-                            target_urls.append(ep_url)
-                            added += 1
-                    if added:
-                        log.info(f"Schema: added {added} pattern endpoint(s) to scan queue")
-
-                log.info(f"Discovery + Schema: scanning {len(target_urls)} URL(s)")
-
-            # Schema provides category-level sqli hints (positions to try first, likely DB).
-            # These are soft hints — the extractor still runs full enumeration if they miss.
-            schema_sqli_hints: dict[str, Any] = {}
-            if self.matched_schema:
-                schema_sqli_hints = self.matched_schema.get_sqli_hints()
+                log.info(f"Discovery: {len(target_urls)} URL(s) queued")
 
             tasks = []
             for url in target_urls:
@@ -115,13 +88,6 @@ class Orchestrator:
                             continue
 
                     merged_options = {**plugin_cfg.options}
-                    if plugin_id == "sqli":
-                        if schema_sqli_hints:
-                            merged_options["schema_hints"] = schema_sqli_hints
-                        merged_options["_ai_config"] = {
-                            "enabled": self.settings.ai.enabled,
-                            "provider": self.settings.ai.provider,
-                        }
                     ctx = PluginContext(
                         target=url_target,
                         http_client=http_client,

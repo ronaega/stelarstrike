@@ -24,9 +24,9 @@ from __future__ import annotations
 import re
 import uuid
 
-from stelarstrike.core.report import Finding
-from stelarstrike.plugins.base import VulnerabilityPlugin
-from stelarstrike.utils.http_client import extract_forms
+from assets.core.report import Finding
+from assets.plugins.base import VulnerabilityPlugin
+from assets.utils.http_client import extract_forms
 
 _URL_HINT_PATTERN = re.compile(r"""(https?://[^\s"'<>]+|/[a-zA-Z0-9_\-./]+\.(?:php|jsp|asp|svg|txt))""")
 

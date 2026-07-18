@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from stelarstrike.core.discovery import discover_targets
+from assets.core.discovery import discover_targets
 
 
 class _FakeResp:

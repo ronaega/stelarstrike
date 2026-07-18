@@ -14,9 +14,9 @@ protection is flagged at lower severity (defense-in-depth gap).
 
 from __future__ import annotations
 
-from stelarstrike.core.report import Finding
-from stelarstrike.plugins.base import VulnerabilityPlugin
-from stelarstrike.utils.http_client import extract_forms
+from assets.core.report import Finding
+from assets.plugins.base import VulnerabilityPlugin
+from assets.utils.http_client import extract_forms
 
 _TOKEN_FIELD_HINTS = ["csrf", "xsrf", "authenticity_token", "_token", "nonce", "anti-forgery"]
 

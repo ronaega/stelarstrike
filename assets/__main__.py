@@ -35,11 +35,11 @@ def main() -> None:
         agent_name = args[0]
         # Prompt is the second argument (must be quoted by the shell — arrives as one string)
         raw_prompt = args[1] if len(args) > 1 else None
-        from stelarstrike.cli import run_agent_chat  # noqa: PLC0415
+        from assets.cli import run_agent_chat  # noqa: PLC0415
         run_agent_chat(agent_name, raw_prompt)
         return
 
-    from stelarstrike.cli import app  # noqa: PLC0415
+    from assets.cli import app  # noqa: PLC0415
     app()
 
 

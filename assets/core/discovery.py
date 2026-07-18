@@ -28,9 +28,9 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
-from stelarstrike.core.target import Target, ScopeError, enforce_scope
-from stelarstrike.utils.http_client import build_url_with_params, extract_forms, get_query_params
-from stelarstrike.utils.logger import get_logger
+from assets.core.target import Target, ScopeError, enforce_scope
+from assets.utils.http_client import build_url_with_params, extract_forms, get_query_params
+from assets.utils.logger import get_logger
 
 log = get_logger(__name__)
 

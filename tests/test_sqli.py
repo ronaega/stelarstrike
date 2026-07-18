@@ -13,10 +13,10 @@ import json as _json
 import pytest
 from unittest.mock import AsyncMock
 
-from stelarstrike.core.target import Target
-from stelarstrike.plugins.base import PluginContext
-from stelarstrike.plugins.sqli import SQLiPlugin
-from stelarstrike.skills.sqli_skill import (
+from assets.core.target import Target
+from assets.plugins.base import PluginContext
+from assets.plugins.sqli import SQLiPlugin
+from assets.skills.sqli_skill import (
     AUTH_BYPASS_PAYLOADS,
     COMMON_ENDPOINTS,
     DB_ERROR_SIGNATURES,

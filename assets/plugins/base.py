@@ -15,8 +15,8 @@ from typing import Any
 
 import httpx
 
-from stelarstrike.core.report import Finding
-from stelarstrike.core.target import Target
+from assets.core.report import Finding
+from assets.core.target import Target
 
 
 @dataclass

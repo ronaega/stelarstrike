@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import uuid
 
-from stelarstrike.core.report import Finding
-from stelarstrike.plugins.base import VulnerabilityPlugin
-from stelarstrike.utils.http_client import build_url_with_params, extract_forms, get_query_params
+from assets.core.report import Finding
+from assets.plugins.base import VulnerabilityPlugin
+from assets.utils.http_client import build_url_with_params, extract_forms, get_query_params
 
 
 class XSSPlugin(VulnerabilityPlugin):

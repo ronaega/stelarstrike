@@ -33,9 +33,9 @@ from typing import Any
 
 import httpx
 
-from stelarstrike.core.report import Finding
-from stelarstrike.plugins.base import VulnerabilityPlugin
-from stelarstrike.skills.sqli_skill import (
+from assets.core.report import Finding
+from assets.plugins.base import VulnerabilityPlugin
+from assets.skills.sqli_skill import (
     AUTH_BYPASS_PAYLOADS,
     COMMENT_STYLES,
     COMMON_ENDPOINTS,
@@ -46,7 +46,7 @@ from stelarstrike.skills.sqli_skill import (
     SUCCESS_SIGNALS,
     UNION_MAX_COLS,
 )
-from stelarstrike.utils.logger import get_logger
+from assets.utils.logger import get_logger
 
 log = get_logger(__name__)
 

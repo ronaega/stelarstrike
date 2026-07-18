@@ -1,7 +1,7 @@
-from stelarstrike.core.report import Finding, ReportBuilder
-from stelarstrike.core.target import ScopeError, Target, enforce_scope
-from stelarstrike.plugins import PLUGIN_REGISTRY
-from stelarstrike.utils.http_client import build_url_with_params, get_query_params
+from assets.core.report import Finding, ReportBuilder
+from assets.core.target import ScopeError, Target, enforce_scope
+from assets.plugins import PLUGIN_REGISTRY
+from assets.utils.http_client import build_url_with_params, get_query_params
 
 
 def test_all_expected_plugins_registered():
