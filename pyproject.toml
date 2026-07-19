@@ -30,7 +30,7 @@ dev = [
 ]
 
 [project.scripts]
-stelarstrike = "assets.cli:app"
+stelarstrike = "assets.__main__:main"
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
