@@ -111,7 +111,7 @@ def scan(
 
 # ── agent commands ────────────────────────────────────────────────────────
 
-@app.command(name="--createagent")
+@app.command(name="createagent")
 def createagent(
     name: str = typer.Argument(..., help="Agent name (2-7 alphanumeric chars, no 'stelarstrike' or 'agent')"),
     target: str = typer.Argument(..., help="Target URL this agent will operate on"),
@@ -125,7 +125,7 @@ def createagent(
     console.print(f"[bold green]{msg}[/]")
 
 
-@app.command(name="--deleteagent")
+@app.command(name="deleteagent")
 def deleteagent(
     name: str = typer.Argument(..., help="Agent name to delete"),
 ):
@@ -138,7 +138,7 @@ def deleteagent(
     console.print(f"[bold green]{msg}[/]")
 
 
-@app.command(name="--agents")
+@app.command(name="agents")
 def agents_list():
     """List all agents and their assigned targets."""
     from assets.core.agent import list_agents  # noqa: PLC0415
@@ -162,7 +162,7 @@ def agents_list():
 
 # ── skills / tools / schemas ──────────────────────────────────────────────
 
-@app.command(name="--skills")
+@app.command(name="skills")
 def skills_list():
     """List all available skills and their descriptions."""
     from assets.core.agent import list_skills  # noqa: PLC0415
@@ -176,7 +176,7 @@ def skills_list():
     console.print("\n[dim]Skills are used automatically by agents during action execution.[/]")
 
 
-@app.command(name="--tools")
+@app.command(name="tools")
 def tools_list():
     """List all available tools and their descriptions."""
     from assets.core.agent import list_tools  # noqa: PLC0415
@@ -234,7 +234,7 @@ def plugins():
     console.print(table)
 
 
-@app.command(name="--version")
+@app.command(name="version")
 def version():
     """Show the current version of StelarStrike."""
     console.print(f"StelarStrike [bold cyan]{VERSION}[/]")
